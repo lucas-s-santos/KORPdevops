@@ -6,11 +6,13 @@
 # O site.yml também instala o que estiver faltando automaticamente, para que
 # o ambiente suba com um único comando.
 collections:
-  # Faixa testada. O piso não é decorativo:
-  #   3.6.0 -> docker_image_build (build via buildx/BuildKit)
-  #   3.9.0 -> docker_compose_v2 com wait/wait_timeout
-  # O teto evita a 4.x, que remove módulos usados aqui sem aviso.
+  # Piso real: 3.6.0 introduziu docker_image_build (build via buildx, o que
+  # o Dockerfile exige por usar RUN --mount) e docker_compose_v2. É também a
+  # versão que o Ubuntu 24.04 já satisfaz (traz 3.7.0), o que importa: uma
+  # coleção instalada no meio da execução não vale para o processo em curso,
+  # então o playbook não pode depender de nada acima disso para funcionar
+  # com um único comando. O teto evita a 4.x, que remove módulos usados aqui.
   - name: community.docker
-    version: ">=3.10.0,<4.0.0"
+    version: ">=3.6.0,<4.0.0"
   - name: community.general
     version: ">=8.0.0"

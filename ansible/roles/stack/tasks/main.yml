@@ -12,11 +12,38 @@
     state: present
     # Recria containers cuja configuração mudou, sem tocar nos demais.
     recreate: auto
-    # Aguarda os healthchecks ficarem verdes antes de seguir; é o que impede
-    # a validação de rodar contra um serviço que ainda está subindo.
-    wait: true
-    wait_timeout: 180
   register: resultado_compose
+
+# A espera é feita aqui, e não pela opção `wait` do docker_compose_v2, de
+# propósito: `wait` só existe a partir da community.docker 3.9.0, e o pacote
+# `ansible` do Ubuntu 24.04 traz a 3.7.0. Como uma coleção instalada durante
+# a execução não passa a valer no mesmo processo (o carregador de plugins já
+# resolveu a versão antiga), depender de `wait` quebraria o requisito de
+# provisionar tudo com UM único comando numa máquina recém-instalada.
+#
+# Esperar explicitamente ainda rende um erro melhor: diz QUAL container não
+# ficou saudável, em vez de estourar um timeout genérico do Compose.
+- name: Aguardar os containers ficarem saudáveis
+  community.docker.docker_container_info:
+    name: "{{ item }}"
+  register: estado_container
+  until:
+    - estado_container.exists | default(false)
+    # Containers sem healthcheck (exporters) não têm State.Health; para eles
+    # basta existirem e estarem em execução.
+    - (estado_container.container.State.Health.Status | default('healthy')) == 'healthy'
+    - estado_container.container.State.Running | default(false)
+  retries: 36
+  delay: 5
+  loop:
+    - http-server-projeto-korp
+    - nginx
+    - prometheus
+    - grafana
+    - blackbox-exporter
+    - nginx-exporter
+  loop_control:
+    label: "{{ item }}"
 
 - name: Listar os containers em execução
   community.docker.docker_host_info:
