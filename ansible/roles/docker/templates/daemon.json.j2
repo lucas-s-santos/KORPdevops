@@ -1,0 +1,16 @@
+{
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3"
+  },
+  "live-restore": true,
+  "features": {
+    "buildkit": true
+  },
+  "default-address-pools": [
+{% for pool in docker_default_address_pools %}
+    { "base": "{{ pool.base }}", "size": {{ pool.size }} }{{ "," if not loop.last else "" }}
+{% endfor %}
+  ]
+}

@@ -1,0 +1,68 @@
+---
+# ===========================================================================
+# Role: monitoramento — Prometheus, Blackbox e Grafana (datasource +
+# dashboard provisionados por arquivo, sem nenhum clique na interface)
+# ===========================================================================
+
+- name: Copiar a configuração do Prometheus
+  ansible.builtin.copy:
+    src: "{{ raiz_repositorio }}/prometheus/prometheus.yml"
+    dest: "{{ projeto_dir }}/prometheus/prometheus.yml"
+    mode: "0644"
+  register: conf_prometheus
+
+- name: Copiar as regras de alerta
+  ansible.builtin.copy:
+    src: "{{ raiz_repositorio }}/prometheus/rules/"
+    dest: "{{ projeto_dir }}/prometheus/rules/"
+    mode: "0644"
+  register: regras_prometheus
+
+- name: Copiar a configuração do Blackbox Exporter
+  ansible.builtin.copy:
+    src: "{{ raiz_repositorio }}/blackbox/blackbox.yml"
+    dest: "{{ projeto_dir }}/blackbox/blackbox.yml"
+    mode: "0644"
+
+- name: Copiar o provisionamento do Grafana (datasource e provider)
+  ansible.builtin.copy:
+    src: "{{ raiz_repositorio }}/grafana/provisioning/"
+    dest: "{{ projeto_dir }}/grafana/provisioning/"
+    mode: "0644"
+
+- name: Copiar o JSON do dashboard
+  ansible.builtin.copy:
+    src: "{{ raiz_repositorio }}/grafana/dashboards/http-server-projeto-korp-dashboard.json"
+    dest: "{{ projeto_dir }}/grafana/dashboards/http-server-projeto-korp-dashboard.json"
+    mode: "0644"
+
+- name: Conferir se o Prometheus já está em execução
+  community.docker.docker_container_info:
+    name: prometheus
+  register: info_prometheus
+  failed_when: false
+
+# `--web.enable-lifecycle` no compose é o que habilita este endpoint. Recarregar
+# a configuração sem reiniciar preserva os dados em memória e evita buraco na
+# série temporal.
+- name: Recarregar a configuração do Prometheus
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ porta_prometheus }}/-/reload"
+    method: POST
+    status_code: [200]
+  when:
+    - info_prometheus.exists | default(false)
+    - (conf_prometheus is changed) or (regras_prometheus is changed)
+  retries: 3
+  delay: 2
+  register: reload_prometheus
+  until: reload_prometheus is succeeded
+  failed_when: false
+
+- name: Confirmar os arquivos de monitoramento
+  ansible.builtin.debug:
+    msg:
+      - "Prometheus : {{ projeto_dir }}/prometheus/prometheus.yml"
+      - "Alertas    : {{ projeto_dir }}/prometheus/rules/"
+      - "Blackbox   : {{ projeto_dir }}/blackbox/blackbox.yml"
+      - "Grafana    : datasource e dashboard provisionados por arquivo"

@@ -1,0 +1,30 @@
+---
+# ===========================================================================
+# Role: rede — cria a rede Docker bridge usada por toda a stack
+#
+# Uma rede definida pelo usuário (em vez da `bridge` padrão) dá duas coisas
+# que o desafio precisa: resolução DNS pelo nome do container e isolamento
+# em relação a outros containers da máquina.
+# ===========================================================================
+
+- name: Criar a rede bridge {{ rede_nome }}
+  community.docker.docker_network:
+    name: "{{ rede_nome }}"
+    driver: "{{ rede_driver }}"
+    ipam_config:
+      - subnet: "{{ rede_subnet }}"
+        gateway: "{{ rede_gateway }}"
+    driver_options:
+      # Nome previsível da interface no host — facilita `ip a` e tcpdump.
+      com.docker.network.bridge.name: br-korp
+      com.docker.network.bridge.enable_icc: "true"
+    labels:
+      projeto: projeto-korp
+      gerenciado_por: ansible
+    state: present
+  register: resultado_rede
+
+- name: Confirmar a criação da rede
+  ansible.builtin.debug:
+    msg: >-
+      Rede {{ rede_nome }} ({{ rede_driver }}) pronta em {{ rede_subnet }}.

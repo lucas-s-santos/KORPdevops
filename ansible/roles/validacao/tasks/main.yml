@@ -1,0 +1,215 @@
+---
+# ===========================================================================
+# Role: validacao — prova que o ambiente está de pé
+#
+# O playbook não termina dizendo "provisionei"; ele termina mostrando a
+# resposta real do serviço no console. Se qualquer verificação falhar, a
+# execução falha junto.
+# ===========================================================================
+
+- name: Aguardar a porta {{ porta_http }} aceitar conexões
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: "{{ porta_http }}"
+    state: started
+    timeout: 90
+    delay: 2
+
+# ---------------------------------------------------------------------------
+# 1) Requisição HTTP ao endpoint do desafio, passando pelo NGINX
+# ---------------------------------------------------------------------------
+- name: "Requisitar GET {{ url_validacao }} (através do proxy reverso)"
+  ansible.builtin.uri:
+    url: "{{ url_validacao }}"
+    method: GET
+    return_content: true
+    status_code: 200
+    headers:
+      Accept: application/json
+      User-Agent: ansible-validacao-projeto-korp
+  register: resposta_servico
+  retries: "{{ tentativas_validacao }}"
+  delay: "{{ espera_entre_tentativas }}"
+  until: resposta_servico.status | default(0) == 200
+
+- name: Validar o contrato do JSON devolvido
+  ansible.builtin.assert:
+    that:
+      - resposta_servico.json.nome is defined
+      - resposta_servico.json.nome == 'Projeto Korp'
+      - resposta_servico.json.horario is defined
+      # Formato RFC 3339 terminado em "Z" — ou seja, realmente em UTC.
+      - resposta_servico.json.horario is match('^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$')
+    fail_msg: "A resposta não segue o contrato esperado: {{ resposta_servico.content | default('(vazia)') }}"
+    success_msg: "Contrato do JSON validado com sucesso."
+
+- name: Confirmar que o horário é resolvido dinamicamente
+  block:
+    - name: Segunda requisição, após um intervalo
+      ansible.builtin.pause:
+        seconds: 2
+
+    - name: "Requisitar GET {{ url_validacao }} novamente"
+      ansible.builtin.uri:
+        url: "{{ url_validacao }}"
+        method: GET
+        return_content: true
+        status_code: 200
+      register: segunda_resposta
+
+    - name: Comparar os dois horários
+      ansible.builtin.assert:
+        that:
+          - segunda_resposta.json.horario != resposta_servico.json.horario
+        fail_msg: >-
+          As duas requisições retornaram o mesmo horário
+          ({{ resposta_servico.json.horario }}) — o valor não está sendo
+          resolvido por requisição.
+        success_msg: "Horário resolvido dinamicamente a cada requisição."
+
+# ---------------------------------------------------------------------------
+# 2) A resposta, exibida no console (requisito explícito do desafio)
+# ---------------------------------------------------------------------------
+- name: RESPOSTA DO SERVIÇO
+  ansible.builtin.debug:
+    msg: |-
+
+      ===========================================================
+       curl http://localhost:{{ porta_http }}/projeto-korp
+      ===========================================================
+       HTTP {{ resposta_servico.status }}
+       Content-Type: {{ resposta_servico.content_type | default('n/d') }}
+
+       {{ resposta_servico.content }}
+
+       nome    -> {{ resposta_servico.json.nome }}
+       horario -> {{ resposta_servico.json.horario }} (UTC)
+
+       Segunda chamada, 2s depois:
+       horario -> {{ segunda_resposta.json.horario }} (UTC)
+      ===========================================================
+
+# ---------------------------------------------------------------------------
+# 3) Monitoramento
+# ---------------------------------------------------------------------------
+- name: Verificar as métricas expostas pela aplicação
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ porta_http }}/metrics"
+    method: GET
+    return_content: true
+    status_code: 200
+  register: resposta_metricas
+
+- name: Conferir que as métricas obrigatórias estão presentes
+  ansible.builtin.assert:
+    that:
+      # Volume de requisições
+      - "'korp_http_requests_total' in resposta_metricas.content"
+      # Disponibilidade
+      - "'korp_service_up' in resposta_metricas.content"
+      - "'korp_http_request_duration_seconds' in resposta_metricas.content"
+    fail_msg: "As métricas obrigatórias não foram encontradas em /metrics."
+    success_msg: "Métricas de disponibilidade e volume expostas no padrão Prometheus."
+
+- name: Aguardar o Prometheus registrar os alvos como saudáveis
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ porta_prometheus }}/api/v1/targets?state=active"
+    method: GET
+    return_content: true
+    status_code: 200
+  register: alvos_prometheus
+  retries: 30
+  delay: 3
+  until:
+    - alvos_prometheus.json is defined
+    - >-
+      alvos_prometheus.json.data.activeTargets
+      | selectattr('labels.job', 'equalto', servico_nome)
+      | selectattr('health', 'equalto', 'up')
+      | list | length > 0
+
+- name: Exibir a situação de cada alvo do Prometheus
+  ansible.builtin.debug:
+    msg: >-
+      {{ item.labels.job }} ({{ item.scrapeUrl }}) -> {{ item.health | upper }}
+  loop: "{{ alvos_prometheus.json.data.activeTargets }}"
+  loop_control:
+    label: "{{ item.labels.job }}"
+
+- name: Consultar a disponibilidade calculada pelo Prometheus
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ porta_prometheus }}/api/v1/query"
+    method: POST
+    return_content: true
+    body_format: form-urlencoded
+    body:
+      query: 'up{job="{{ servico_nome }}"}'
+  register: consulta_up
+  failed_when: false
+
+- name: Exibir o resultado da consulta PromQL
+  ansible.builtin.debug:
+    msg: >-
+      up{job="{{ servico_nome }}"} =
+      {{ consulta_up.json.data.result[0].value[1] | default('sem dado ainda') }}
+  when: consulta_up.json is defined
+
+- name: Verificar a saúde do Grafana
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ porta_grafana }}/api/health"
+    method: GET
+    return_content: true
+    status_code: 200
+  register: saude_grafana
+  retries: 20
+  delay: 3
+  until: saude_grafana.status | default(0) == 200
+
+- name: Confirmar que o dashboard foi provisionado
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ porta_grafana }}/api/dashboards/uid/projeto-korp"
+    method: GET
+    user: "{{ grafana_usuario }}"
+    password: "{{ grafana_senha }}"
+    force_basic_auth: true
+    return_content: true
+    status_code: 200
+  register: dashboard_grafana
+  retries: 20
+  delay: 3
+  until: dashboard_grafana.status | default(0) == 200
+
+- name: Confirmar que o datasource foi provisionado
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ porta_grafana }}/api/datasources/uid/prometheus"
+    method: GET
+    user: "{{ grafana_usuario }}"
+    password: "{{ grafana_senha }}"
+    force_basic_auth: true
+    status_code: 200
+  register: datasource_grafana
+  failed_when: false
+
+# ---------------------------------------------------------------------------
+# 4) Resumo final
+# ---------------------------------------------------------------------------
+- name: RESUMO DO AMBIENTE
+  ansible.builtin.debug:
+    msg: |-
+
+      ===========================================================
+       AMBIENTE DO PROJETO KORP PROVISIONADO
+      ===========================================================
+       Serviço      http://localhost:{{ porta_http }}/projeto-korp   [OK]
+       Métricas     http://localhost:{{ porta_http }}/metrics        [OK]
+       Prometheus   http://localhost:{{ porta_prometheus }}          [{{ 'OK' if alvos_prometheus.status | default(0) == 200 else 'FALHA' }}]
+       Grafana      http://localhost:{{ porta_grafana }}             [{{ saude_grafana.json.database | default('?') | upper }}]
+
+       Dashboard    "{{ dashboard_grafana.json.dashboard.title | default('n/d') }}"
+                    http://localhost:{{ porta_grafana }}/d/projeto-korp
+                    login: {{ grafana_usuario }} / {{ grafana_senha }}
+
+       Datasource   {{ 'provisionado' if datasource_grafana.status | default(0) == 200 else 'verificar' }}
+       Rede Docker  {{ rede_nome }} ({{ rede_driver }}, {{ rede_subnet }})
+       Diretório    {{ projeto_dir }}
+      ===========================================================

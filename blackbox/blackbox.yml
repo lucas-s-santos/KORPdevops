@@ -1,0 +1,27 @@
+# Configuração do blackbox-exporter: define COMO sondar, enquanto o
+# prometheus.yml define O QUE sondar.
+modules:
+  http_2xx_json:
+    prober: http
+    timeout: 5s
+    http:
+      method: GET
+      valid_http_versions: ["HTTP/1.1", "HTTP/2.0"]
+      valid_status_codes: [200]
+      # Só considera sucesso se o corpo realmente contiver o contrato
+      # esperado. Um 200 com corpo errado continua sendo uma falha.
+      fail_if_body_not_matches_regexp:
+        - '"nome"\s*:\s*"Projeto Korp"'
+      preferred_ip_protocol: ip4
+      ip_protocol_fallback: false
+      follow_redirects: true
+
+  # Módulo genérico: só verifica código de status. Usado nas probes de saúde.
+  http_2xx:
+    prober: http
+    timeout: 5s
+    http:
+      method: GET
+      valid_status_codes: [200]
+      preferred_ip_protocol: ip4
+      ip_protocol_fallback: false

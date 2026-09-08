@@ -1,0 +1,15 @@
+# Tudo com fim de linha LF no repositório. Um script .sh ou um Dockerfile
+# salvo com CRLF por um editor Windows quebra dentro do container com
+# "bad interpreter: /usr/bin/env bash^M".
+* text=auto eol=lf
+
+*.sh      text eol=lf
+Makefile  text eol=lf
+*.go      text eol=lf
+*.yml     text eol=lf
+*.yaml    text eol=lf
+*.conf    text eol=lf
+Dockerfile text eol=lf
+
+*.png binary
+*.jpg binary

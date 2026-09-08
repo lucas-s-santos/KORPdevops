@@ -1,0 +1,47 @@
+---
+# ===========================================================================
+# Role: nginx — publica a configuração de proxy reverso no volume montado
+# ===========================================================================
+
+- name: Copiar a configuração do proxy reverso
+  ansible.builtin.copy:
+    src: "{{ raiz_repositorio }}/nginx/conf.d/http-server-projeto-korp.conf"
+    dest: "{{ projeto_dir }}/nginx/conf.d/http-server-projeto-korp.conf"
+    mode: "0644"
+    owner: root
+    group: root
+  register: conf_nginx
+
+- name: Verificar se o container do NGINX já está em execução
+  community.docker.docker_container_info:
+    name: nginx
+  register: info_nginx
+  failed_when: false
+
+# Só faz sentido validar e recarregar se o container já existir: numa
+# primeira execução ele nem foi criado ainda.
+- name: Validar a sintaxe da configuração dentro do container
+  community.docker.docker_container_exec:
+    container: nginx
+    command: nginx -t
+  register: teste_nginx
+  changed_when: false
+  when:
+    - info_nginx.exists | default(false)
+    - conf_nginx is changed
+
+- name: Recarregar o NGINX sem derrubar conexões
+  community.docker.docker_container_exec:
+    container: nginx
+    command: nginx -s reload
+  when:
+    - info_nginx.exists | default(false)
+    - conf_nginx is changed
+    - teste_nginx is succeeded
+
+- name: Confirmar a publicação da configuração
+  ansible.builtin.debug:
+    msg: >-
+      Proxy reverso publicado em
+      {{ projeto_dir }}/nginx/conf.d/http-server-projeto-korp.conf
+      (montado no container em /etc/nginx/conf.d/).

@@ -1,0 +1,12 @@
+---
+# Tradução da arquitetura reportada pelo Ansible para a nomenclatura usada
+# pelos repositórios Debian (x86_64 -> amd64, aarch64 -> arm64).
+arquitetura_deb: >-
+  {{ {'x86_64': 'amd64',
+      'aarch64': 'arm64',
+      'armv7l': 'armhf'}.get(ansible_architecture, 'amd64') }}
+
+# Faixa de endereços usada pelo Docker para as redes criadas automaticamente.
+docker_default_address_pools:
+  - base: "172.30.0.0/16"
+    size: 24

@@ -1,0 +1,13 @@
+---
+- name: reiniciar docker
+  ansible.builtin.systemd:
+    name: docker
+    state: restarted
+    daemon_reload: true
+
+- name: avisar sobre novo login
+  ansible.builtin.debug:
+    msg: >-
+      O usuário {{ usuario_docker }} foi adicionado ao grupo `docker`.
+      A associação só vale numa nova sessão: faça logout/login (ou rode
+      `newgrp docker`) para usar o docker sem sudo.

@@ -1,0 +1,315 @@
+# ---------------------------------------------------------------------------
+# Projeto Korp — stack completa
+#
+#   host:80   -> nginx -> http-server-projeto-korp:8080   (somente rede interna)
+#   host:9090 -> prometheus
+#   host:3000 -> grafana
+#
+# A chave `version:` foi omitida de propósito: está obsoleta no Compose V2 e
+# só gera aviso na subida.
+# ---------------------------------------------------------------------------
+
+name: projeto-korp
+
+# ---------------------------------------------------------------------------
+# Âncoras YAML: rotação de log e política de restart definidas uma vez e
+# reaproveitadas. Sem `max-size`, o log JSON de um container cresce até
+# encher o disco do host — é uma das causas mais comuns de incidente bobo.
+# ---------------------------------------------------------------------------
+x-logging: &logging-padrao
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-restart: &restart-padrao unless-stopped
+
+services:
+  # -------------------------------------------------------------------------
+  # 1) A aplicação Go. NÃO publica portas no host: só é alcançável de dentro
+  #    da rede korp-net, exatamente como pede o desafio.
+  # -------------------------------------------------------------------------
+  http-server-projeto-korp:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+      args:
+        VERSION: ${APP_VERSION:-1.0.0}
+        COMMIT: ${APP_COMMIT:-local}
+        BUILD_DATE: ${APP_BUILD_DATE:-unknown}
+    image: http-server-projeto-korp:${APP_VERSION:-1.0.0}
+    container_name: http-server-projeto-korp
+    hostname: http-server-projeto-korp
+    restart: *restart-padrao
+    logging: *logging-padrao
+
+    environment:
+      LISTEN_ADDR: ":8080"
+      LOG_LEVEL: "info"
+      SERVICE_NAME: "http-server-projeto-korp"
+      TZ: "UTC"
+
+    # `expose` documenta a porta para leitores e ferramentas; ao contrário de
+    # `ports`, não abre absolutamente nada no host.
+    expose:
+      - "8080"
+
+    networks:
+      - korp-net
+
+    # O HEALTHCHECK já vem embutido na imagem; repetido aqui para ficar
+    # explícito e para continuar funcionando se a imagem for trocada.
+    healthcheck:
+      test: ["CMD", "/http-server-projeto-korp", "-healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+    # Endurecimento: sem escalada de privilégio, sem capabilities e com o
+    # sistema de arquivos somente leitura. A aplicação não escreve em disco.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 128M
+        reservations:
+          memory: 32M
+
+  # -------------------------------------------------------------------------
+  # 2) NGINX — a única porta publicada no host (80).
+  # -------------------------------------------------------------------------
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: nginx
+    hostname: nginx
+    restart: *restart-padrao
+    logging: *logging-padrao
+
+    ports:
+      - "80:80"
+
+    volumes:
+      # Volume exigido pelo desafio. Em `:ro` porque o NGINX só precisa ler a
+      # configuração; se o container for comprometido, não altera o host.
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+
+    networks:
+      - korp-net
+
+    # Só sobe depois que a aplicação passa no healthcheck: elimina a janela
+    # de 502 logo após um `docker compose up`.
+    depends_on:
+      http-server-projeto-korp:
+        condition: service_healthy
+
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1/healthz || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+    security_opt:
+      - no-new-privileges:true
+
+  # -------------------------------------------------------------------------
+  # 3) Exporter que traduz o stub_status do NGINX para o formato Prometheus.
+  # -------------------------------------------------------------------------
+  nginx-exporter:
+    image: nginx/nginx-prometheus-exporter:1.3.0
+    container_name: nginx-exporter
+    hostname: nginx-exporter
+    restart: *restart-padrao
+    logging: *logging-padrao
+
+    command:
+      - --nginx.scrape-uri=http://nginx:8081/stub_status
+
+    expose:
+      - "9113"
+
+    networks:
+      - korp-net
+
+    depends_on:
+      nginx:
+        condition: service_healthy
+
+    security_opt:
+      - no-new-privileges:true
+
+  # -------------------------------------------------------------------------
+  # 4) Blackbox exporter — sonda o serviço "de fora", como um usuário real.
+  # -------------------------------------------------------------------------
+  blackbox-exporter:
+    image: prom/blackbox-exporter:v0.25.0
+    container_name: blackbox-exporter
+    hostname: blackbox-exporter
+    restart: *restart-padrao
+    logging: *logging-padrao
+
+    command:
+      - --config.file=/etc/blackbox/blackbox.yml
+      - --log.level=warn
+
+    volumes:
+      - ./blackbox/blackbox.yml:/etc/blackbox/blackbox.yml:ro
+
+    expose:
+      - "9115"
+
+    networks:
+      - korp-net
+
+    security_opt:
+      - no-new-privileges:true
+
+  # -------------------------------------------------------------------------
+  # 5) Prometheus — coleta e armazena as séries temporais.
+  # -------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: prometheus
+    hostname: prometheus
+    restart: *restart-padrao
+    logging: *logging-padrao
+
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      # Permite recarregar a configuração com POST /-/reload, sem reiniciar.
+      - --web.enable-lifecycle
+      - --web.console.libraries=/usr/share/prometheus/console_libraries
+      - --web.console.templates=/usr/share/prometheus/consoles
+
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/rules:/etc/prometheus/rules:ro
+      # Volume nomeado: as séries sobrevivem a `docker compose down`.
+      - prometheus-data:/prometheus
+
+    ports:
+      - "9090:9090"
+
+    networks:
+      - korp-net
+
+    depends_on:
+      - http-server-projeto-korp
+      - blackbox-exporter
+
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:9090/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+    security_opt:
+      - no-new-privileges:true
+
+  # -------------------------------------------------------------------------
+  # 6) Grafana — visualização. Datasource e dashboard vêm provisionados por
+  #    arquivo; nada é configurado à mão pela interface.
+  # -------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: grafana
+    hostname: grafana
+    restart: *restart-padrao
+    logging: *logging-padrao
+
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      # Abre direto no dashboard do projeto ao entrar.
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/http-server-projeto-korp-dashboard.json
+      GF_LOG_LEVEL: warn
+
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+
+    ports:
+      - "3000:3000"
+
+    networks:
+      - korp-net
+
+    depends_on:
+      prometheus:
+        condition: service_healthy
+
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:3000/api/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+    security_opt:
+      - no-new-privileges:true
+
+  # -------------------------------------------------------------------------
+  # 7) Gerador de carga (opcional) — só sobe com o perfil `carga`:
+  #        docker compose --profile carga up -d
+  #    Existe para os gráficos terem tráfego real durante a demonstração.
+  # -------------------------------------------------------------------------
+  gerador-de-carga:
+    image: curlimages/curl:8.10.1
+    container_name: gerador-de-carga
+    restart: *restart-padrao
+    logging: *logging-padrao
+    profiles: ["carga"]
+
+    networks:
+      - korp-net
+
+    depends_on:
+      nginx:
+        condition: service_healthy
+
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        echo "gerando trafego continuo contra o nginx..."
+        while true; do
+          curl -s -o /dev/null http://nginx/projeto-korp
+          curl -s -o /dev/null http://nginx/healthz
+          curl -s -o /dev/null http://nginx/rota-inexistente
+          sleep 1
+        done
+
+# ---------------------------------------------------------------------------
+# Rede bridge dedicada. Declarada como `external` porque é criada num passo
+# anterior (pelo playbook Ansible ou por `make rede`), atendendo ao requisito
+# de "criar a rede Docker" como etapa própria.
+#
+# Containers numa rede definida pelo usuário se enxergam pelo nome do serviço
+# através do DNS interno do Docker (127.0.0.11) — é por isso que o NGINX
+# consegue usar `http-server-projeto-korp` como hostname. Na rede `bridge`
+# padrão isso não funcionaria: lá não há resolução por nome.
+# ---------------------------------------------------------------------------
+networks:
+  korp-net:
+    external: true
+    name: korp-net
+
+volumes:
+  prometheus-data:
+    name: projeto-korp-prometheus-data
+  grafana-data:
+    name: projeto-korp-grafana-data

@@ -1,0 +1,16 @@
+# Provisionamento de dashboards: o Grafana lê todo JSON encontrado na pasta
+# abaixo e mantém sincronizado com o disco.
+apiVersion: 1
+
+providers:
+  - name: projeto-korp
+    orgId: 1
+    folder: Projeto Korp
+    type: file
+    disableDeletion: false
+    # Recarrega alterações no JSON sem precisar reiniciar o container.
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

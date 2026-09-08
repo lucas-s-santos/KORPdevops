@@ -1,0 +1,46 @@
+# ---------------------------------------------------------------------------
+# Variáveis compartilhadas por todas as roles.
+#
+# Ficam centralizadas aqui para que mudar uma porta, um nome ou uma versão
+# seja uma edição só, num lugar só — e não uma caça a valores repetidos.
+# ---------------------------------------------------------------------------
+
+# Diretório do repositório (o playbook fica em <repo>/ansible).
+raiz_repositorio: "{{ playbook_dir | dirname }}"
+
+# Onde a stack é instalada no servidor de destino.
+projeto_dir: /opt/projeto-korp
+
+# Usuário que ficará no grupo `docker` (poder usar docker sem sudo).
+usuario_docker: "{{ ansible_env.SUDO_USER | default(ansible_user_id, true) }}"
+
+# --- Serviço --------------------------------------------------------------
+servico_nome: http-server-projeto-korp
+servico_porta: 8080
+servico_versao: "1.0.0"
+imagem_nome: "http-server-projeto-korp"
+imagem_tag: "{{ servico_versao }}"
+
+# --- Rede Docker ----------------------------------------------------------
+rede_nome: korp-net
+rede_driver: bridge
+# Sub-rede fixa: evita colisão com faixas já usadas na infraestrutura e
+# deixa as regras de firewall previsíveis.
+rede_subnet: "172.28.0.0/16"
+rede_gateway: "172.28.0.1"
+
+# --- Portas publicadas no host -------------------------------------------
+porta_http: 80
+porta_prometheus: 9090
+porta_grafana: 3000
+
+# --- Grafana --------------------------------------------------------------
+grafana_usuario: admin
+# Em produção viria de um Ansible Vault ou de um cofre externo; aqui fica
+# explícito porque o ambiente é descartável e a avaliação precisa entrar.
+grafana_senha: admin
+
+# --- Validação ------------------------------------------------------------
+url_validacao: "http://127.0.0.1:{{ porta_http }}/projeto-korp"
+tentativas_validacao: 30
+espera_entre_tentativas: 2

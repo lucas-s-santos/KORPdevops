@@ -1,0 +1,94 @@
+---
+# ===========================================================================
+# Projeto Korp — provisionamento completo do ambiente
+#
+# Executar com UM único comando:
+#
+#     ansible-playbook -i inventory.ini site.yml
+#
+# O playbook é idempotente: rodar duas vezes seguidas não muda nada na
+# segunda execução (todas as tarefas voltam "ok", não "changed").
+# ===========================================================================
+
+- name: Provisionar o ambiente do Projeto Korp
+  hosts: korp
+  become: true
+  gather_facts: true
+
+  vars:
+    colecoes_necessarias:
+      - community.docker
+      - community.general
+
+  pre_tasks:
+    - name: Conferir se a distribuição é suportada
+      ansible.builtin.assert:
+        that:
+          - ansible_os_family in ['Debian', 'RedHat']
+        fail_msg: >-
+          Distribuição {{ ansible_distribution }} ({{ ansible_os_family }})
+          não é suportada por este playbook. Suportadas: Debian/Ubuntu e
+          RHEL/Rocky/AlmaLinux/Fedora.
+        success_msg: "{{ ansible_distribution }} {{ ansible_distribution_version }} — suportada."
+      tags: [sempre, checagem]
+
+    # As roles usam módulos da coleção community.docker. Instalar aqui, se
+    # faltar, é o que permite cumprir o requisito de "um único comando":
+    # quem clona o repositório não precisa lembrar do ansible-galaxy.
+    - name: Verificar coleções do Ansible Galaxy já instaladas
+      ansible.builtin.command: ansible-galaxy collection list
+      register: colecoes_instaladas
+      changed_when: false
+      failed_when: false
+      become: false
+      delegate_to: localhost
+      run_once: true
+      tags: [sempre, checagem]
+
+    - name: Instalar coleções ausentes
+      ansible.builtin.command: "ansible-galaxy collection install {{ item }}"
+      loop: "{{ colecoes_necessarias }}"
+      when: item not in (colecoes_instaladas.stdout | default(''))
+      changed_when: true
+      become: false
+      delegate_to: localhost
+      run_once: true
+      tags: [sempre, checagem]
+
+    - name: Mostrar o alvo do provisionamento
+      ansible.builtin.debug:
+        msg:
+          - "Host        : {{ inventory_hostname }}"
+          - "Distribuição: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+          - "Arquitetura : {{ ansible_architecture }}"
+          - "Destino     : {{ projeto_dir }}"
+      tags: [sempre]
+
+  roles:
+    # 1) Instalação e configuração do Docker (Parte 1, item 2)
+    - role: docker
+      tags: [docker, infra]
+
+    # 2) Criação da rede bridge (Parte 1, item 3)
+    - role: rede
+      tags: [rede, infra]
+
+    # 3) Código-fonte no servidor + build da imagem (Parte 1, item 1)
+    - role: aplicacao
+      tags: [aplicacao, build]
+
+    # 4) Proxy reverso (Parte 1, item 5)
+    - role: nginx
+      tags: [nginx, proxy]
+
+    # 5) Prometheus, Grafana e exporters (Parte 2)
+    - role: monitoramento
+      tags: [monitoramento, observabilidade]
+
+    # 6) Subida dos containers com Docker Compose (Parte 1, item 4)
+    - role: stack
+      tags: [stack, compose]
+
+    # 7) Validação por requisição HTTP e exibição no console (Parte 3)
+    - role: validacao
+      tags: [validacao, teste]

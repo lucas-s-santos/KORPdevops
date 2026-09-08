@@ -1,0 +1,87 @@
+# ---------------------------------------------------------------------------
+# Prometheus — coleta das métricas do ambiente Projeto Korp
+# ---------------------------------------------------------------------------
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  evaluation_interval: 15s
+  # Labels carimbadas em toda série; identificam a origem quando várias
+  # instâncias federam num Prometheus central ou mandam para um Thanos.
+  external_labels:
+    ambiente: desafio-korp
+    origem: prometheus-local
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+scrape_configs:
+  # 1) O próprio Prometheus — se ele não estiver saudável, nenhuma outra
+  #    métrica é confiável.
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+        labels:
+          servico: prometheus
+
+  # 2) A aplicação. A coleta acontece pela rede Docker interna, direto na
+  #    porta 8080 — sem passar pelo NGINX, para que uma falha do proxy não
+  #    seja confundida com uma falha da aplicação.
+  - job_name: http-server-projeto-korp
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["http-server-projeto-korp:8080"]
+        labels:
+          servico: http-server-projeto-korp
+          camada: aplicacao
+
+  # 3) NGINX via nginx-prometheus-exporter (lê o stub_status na porta 8081).
+  - job_name: nginx
+    static_configs:
+      - targets: ["nginx-exporter:9113"]
+        labels:
+          servico: nginx
+          camada: proxy
+
+  # 4) Blackbox: prova o caminho completo (NGINX -> aplicação) do lado de
+  #    fora, exatamente como um usuário faria. É a métrica de disponibilidade
+  #    que mais se aproxima da experiência real do cliente.
+  #
+  #    O módulo http_2xx_json também valida o CORPO da resposta: um 200 com
+  #    JSON errado é contado como indisponibilidade, não como sucesso.
+  - job_name: blackbox-endpoint-korp
+    metrics_path: /probe
+    params:
+      module: [http_2xx_json]
+    static_configs:
+      - targets:
+          - http://nginx:80/projeto-korp
+        labels:
+          camada: fim-a-fim
+    relabel_configs:
+      # O alvo real da requisição é o blackbox-exporter; a URL sondada viaja
+      # como parâmetro. Esta é a dança padrão de relabel do blackbox.
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox-exporter:9115
+
+  # 5) Probe simples de saúde, direto na aplicação (sem o proxy no caminho).
+  #    Comparar os dois probes isola se a falha está no NGINX ou na aplicação.
+  - job_name: blackbox-health
+    metrics_path: /probe
+    params:
+      module: [http_2xx]
+    static_configs:
+      - targets:
+          - http://http-server-projeto-korp:8080/healthz
+        labels:
+          camada: aplicacao
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox-exporter:9115

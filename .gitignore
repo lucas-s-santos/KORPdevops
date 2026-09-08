@@ -1,0 +1,19 @@
+# Go
+app/bin/
+app/dist/
+*.test
+*.out
+coverage.html
+
+# Ansible
+*.retry
+ansible/.vault_pass
+ansible/collections/
+
+# Local
+.env
+.env.local
+*.log
+.DS_Store
+.idea/
+.vscode/

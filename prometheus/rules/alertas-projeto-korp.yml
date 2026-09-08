@@ -1,0 +1,60 @@
+# Regras de alerta. Ficam visíveis em Prometheus > Alerts; num ambiente real
+# seriam encaminhadas por um Alertmanager para Slack/PagerDuty.
+groups:
+  - name: disponibilidade-projeto-korp
+    rules:
+      # `up` é sintetizada pelo Prometheus a cada coleta: 1 se o alvo
+      # respondeu, 0 se não. É o sinal mais direto de "o processo caiu".
+      - alert: ServicoIndisponivel
+        expr: up{job="http-server-projeto-korp"} == 0
+        for: 1m
+        labels:
+          severidade: critico
+        annotations:
+          resumo: "http-server-projeto-korp não responde à coleta"
+          descricao: "O alvo {{ $labels.instance }} está fora há mais de 1 minuto."
+
+      # Falha no caminho ponta a ponta, mesmo com o processo de pé
+      # (ex.: NGINX com configuração quebrada).
+      - alert: CaminhoFimAFimFalhando
+        expr: probe_success{instance="http://nginx:80/projeto-korp"} == 0
+        for: 1m
+        labels:
+          severidade: critico
+        annotations:
+          resumo: "Requisição pelo NGINX está falhando"
+          descricao: "O probe do blackbox em {{ $labels.instance }} falha há mais de 1 minuto."
+
+      - alert: TaxaDeErro5xxAlta
+        expr: |
+          sum(rate(korp_http_requests_total{status=~"5.."}[5m]))
+            /
+          sum(rate(korp_http_requests_total[5m])) > 0.05
+        for: 5m
+        labels:
+          severidade: alto
+        annotations:
+          resumo: "Mais de 5% das requisições retornando 5xx"
+          descricao: "Taxa de erro atual: {{ $value | humanizePercentage }}."
+
+      - alert: LatenciaP95Alta
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(korp_http_request_duration_seconds_bucket[5m]))
+          ) > 0.5
+        for: 5m
+        labels:
+          severidade: aviso
+        annotations:
+          resumo: "Latência p95 acima de 500ms"
+          descricao: "p95 atual: {{ $value }}s."
+
+      - alert: CertificadoDeSaudeAusente
+        expr: absent(korp_service_up) == 1
+        for: 2m
+        labels:
+          severidade: aviso
+        annotations:
+          resumo: "A métrica korp_service_up sumiu"
+          descricao: "O serviço parou de expor a própria métrica de disponibilidade."

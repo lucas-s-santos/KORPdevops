@@ -1,0 +1,109 @@
+---
+# ===========================================================================
+# Role: aplicacao — envia o código ao servidor e constrói a imagem Docker
+# ===========================================================================
+
+# Carimbar o commit na imagem é o que permite, olhando o painel
+# "Versão em execução" do Grafana, saber exatamente qual código está no ar.
+- name: Descobrir o commit atual do repositório
+  ansible.builtin.command: "git -C {{ raiz_repositorio }} rev-parse --short HEAD"
+  register: git_commit
+  changed_when: false
+  failed_when: false
+  become: false
+  delegate_to: localhost
+
+- name: Definir a identificação do build
+  ansible.builtin.set_fact:
+    commit_atual: "{{ git_commit.stdout | default('ansible', true) | trim or 'ansible' }}"
+
+- name: Criar a árvore de diretórios da stack
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+    owner: root
+    group: root
+  loop:
+    - "{{ projeto_dir }}"
+    - "{{ projeto_dir }}/app"
+    - "{{ projeto_dir }}/nginx/conf.d"
+    - "{{ projeto_dir }}/prometheus/rules"
+    - "{{ projeto_dir }}/blackbox"
+    - "{{ projeto_dir }}/grafana/provisioning/datasources"
+    - "{{ projeto_dir }}/grafana/provisioning/dashboards"
+    - "{{ projeto_dir }}/grafana/dashboards"
+
+- name: Copiar o código-fonte da aplicação
+  ansible.builtin.copy:
+    src: "{{ raiz_repositorio }}/app/"
+    dest: "{{ projeto_dir }}/app/"
+    mode: "0644"
+    owner: root
+    group: root
+  # O registro alimenta o `when` do build: só reconstrói a imagem quando o
+  # código realmente mudou.
+  register: fonte_copiada
+
+- name: Copiar o arquivo do Docker Compose
+  ansible.builtin.copy:
+    src: "{{ raiz_repositorio }}/docker-compose.yml"
+    dest: "{{ projeto_dir }}/docker-compose.yml"
+    mode: "0644"
+  register: compose_copiado
+
+- name: Gerar o arquivo .env consumido pelo Compose
+  ansible.builtin.copy:
+    dest: "{{ projeto_dir }}/.env"
+    mode: "0640"
+    content: |
+      # Gerado pelo Ansible — não editar à mão.
+      APP_VERSION={{ servico_versao }}
+      APP_COMMIT={{ commit_atual | default('ansible', true) }}
+      APP_BUILD_DATE={{ ansible_date_time.iso8601 }}
+      GRAFANA_USER={{ grafana_usuario }}
+      GRAFANA_PASSWORD={{ grafana_senha }}
+  register: env_gerado
+
+- name: Verificar se a imagem já existe no host
+  community.docker.docker_image_info:
+    name: "{{ imagem_nome }}:{{ imagem_tag }}"
+  register: imagem_existente
+
+# `docker_image` com source=build usa a API do daemon. Os testes Go rodam
+# dentro do próprio Dockerfile, então um build que passa já significa suíte
+# verde — não existe imagem publicada com teste quebrado.
+- name: Construir a imagem {{ imagem_nome }}:{{ imagem_tag }}
+  community.docker.docker_image:
+    name: "{{ imagem_nome }}"
+    tag: "{{ imagem_tag }}"
+    source: build
+    force_source: "{{ fonte_copiada is changed }}"
+    build:
+      path: "{{ projeto_dir }}/app"
+      dockerfile: Dockerfile
+      pull: true
+      args:
+        VERSION: "{{ servico_versao }}"
+        COMMIT: "{{ commit_atual | default('ansible', true) }}"
+        BUILD_DATE: "{{ ansible_date_time.iso8601 }}"
+      labels:
+        projeto: projeto-korp
+        gerenciado_por: ansible
+    state: present
+  when: imagem_existente.images | length == 0 or fonte_copiada is changed
+  register: build_imagem
+
+# docker_image_tag em vez de docker_image com `repository`: a segunda forma
+# foi removida na community.docker 4.0.
+- name: Marcar também como :latest
+  community.docker.docker_image_tag:
+    name: "{{ imagem_nome }}:{{ imagem_tag }}"
+    repository:
+      - "{{ imagem_nome }}:latest"
+
+- name: Exibir o resultado do build
+  ansible.builtin.debug:
+    msg: >-
+      Imagem {{ imagem_nome }}:{{ imagem_tag }}
+      {{ 'construída agora' if build_imagem is changed else 'já existente, build reaproveitado' }}.

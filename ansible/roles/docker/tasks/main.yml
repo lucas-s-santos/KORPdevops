@@ -1,0 +1,154 @@
+---
+# ===========================================================================
+# Role: docker — instala e configura o Docker Engine
+#
+# Usa o repositório OFICIAL da Docker, não o pacote docker.io das distros:
+# o oficial traz o Compose V2 como plugin e versões atuais do engine.
+# ===========================================================================
+
+- name: Instalar Docker em distribuições Debian/Ubuntu
+  when: ansible_os_family == 'Debian'
+  block:
+    - name: Instalar dependências do repositório APT
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+          - apt-transport-https
+          - python3-pip
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Criar o diretório de chaves do APT
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: "0755"
+
+    - name: Baixar a chave GPG oficial da Docker
+      ansible.builtin.get_url:
+        url: "https://download.docker.com/linux/{{ ansible_distribution | lower }}/gpg"
+        dest: /etc/apt/keyrings/docker.asc
+        mode: "0644"
+        force: false
+
+    # `signed-by` amarra o repositório a esta chave específica. Sem isso, a
+    # chave passa a valer para TODOS os repositórios da máquina.
+    - name: Adicionar o repositório da Docker
+      ansible.builtin.apt_repository:
+        repo: >-
+          deb [arch={{ arquitetura_deb }} signed-by=/etc/apt/keyrings/docker.asc]
+          https://download.docker.com/linux/{{ ansible_distribution | lower }}
+          {{ ansible_distribution_release }} stable
+        filename: docker
+        state: present
+        update_cache: true
+
+    - name: Instalar Docker Engine, CLI e plugins
+      ansible.builtin.apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+        update_cache: true
+      notify: reiniciar docker
+
+    # Os módulos community.docker conversam com o daemon pelo SDK Python,
+    # não pela CLI. Sem este pacote, docker_network e docker_image falham.
+    - name: Instalar o SDK Python do Docker
+      ansible.builtin.apt:
+        name:
+          - python3-docker
+          - python3-requests
+        state: present
+      register: sdk_apt
+      ignore_errors: true
+
+    - name: Instalar o SDK Python do Docker via pip (quando o pacote APT não existe)
+      ansible.builtin.pip:
+        name:
+          - docker>=7.0.0
+        state: present
+        extra_args: "--break-system-packages"
+      when: sdk_apt is failed
+
+- name: Instalar Docker em distribuições RHEL/Rocky/Alma/Fedora
+  when: ansible_os_family == 'RedHat'
+  block:
+    - name: Instalar o plugin de gerenciamento de repositórios
+      ansible.builtin.dnf:
+        name:
+          - dnf-plugins-core
+          - python3-pip
+        state: present
+
+    - name: Adicionar o repositório da Docker
+      ansible.builtin.yum_repository:
+        name: docker-ce-stable
+        description: Docker CE Stable
+        baseurl: "https://download.docker.com/linux/centos/$releasever/$basearch/stable"
+        gpgcheck: true
+        gpgkey: https://download.docker.com/linux/centos/gpg
+        enabled: true
+
+    - name: Instalar Docker Engine, CLI e plugins
+      ansible.builtin.dnf:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+      notify: reiniciar docker
+
+    - name: Instalar o SDK Python do Docker
+      ansible.builtin.pip:
+        name:
+          - docker>=7.0.0
+        state: present
+
+# --------------------------------------------------------------------------
+# Configuração do daemon
+# --------------------------------------------------------------------------
+- name: Configurar o daemon do Docker
+  ansible.builtin.template:
+    src: daemon.json.j2
+    dest: /etc/docker/daemon.json
+    mode: "0644"
+    owner: root
+    group: root
+    # Valida o JSON antes de gravar: um arquivo inválido impede o daemon de
+    # subir, e aí não há mais Docker para consertar nada.
+    validate: "python3 -c \"import json,sys; json.load(open('%s'))\""
+  notify: reiniciar docker
+
+- name: Garantir que o Docker está habilitado no boot e em execução
+  ansible.builtin.systemd:
+    name: docker
+    state: started
+    enabled: true
+    daemon_reload: true
+
+- name: Adicionar o usuário ao grupo docker
+  ansible.builtin.user:
+    name: "{{ usuario_docker }}"
+    groups: docker
+    append: true
+  when: usuario_docker != 'root'
+  # O grupo só passa a valer numa nova sessão de login.
+  notify: avisar sobre novo login
+
+- name: Coletar a versão instalada
+  ansible.builtin.command: docker --version
+  register: versao_docker
+  changed_when: false
+
+- name: Exibir a versão do Docker
+  ansible.builtin.debug:
+    msg: "{{ versao_docker.stdout }}"

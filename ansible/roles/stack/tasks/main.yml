@@ -1,0 +1,39 @@
+---
+# ===========================================================================
+# Role: stack — sobe os containers com Docker Compose
+# ===========================================================================
+
+- name: Subir a stack com Docker Compose
+  community.docker.docker_compose_v2:
+    project_src: "{{ projeto_dir }}"
+    project_name: projeto-korp
+    files:
+      - docker-compose.yml
+    state: present
+    # Recria containers cuja configuração mudou, sem tocar nos demais.
+    recreate: auto
+    # Aguarda os healthchecks ficarem verdes antes de seguir; é o que impede
+    # a validação de rodar contra um serviço que ainda está subindo.
+    wait: true
+    wait_timeout: 180
+  register: resultado_compose
+
+- name: Listar os containers em execução
+  community.docker.docker_host_info:
+    containers: true
+    containers_filters:
+      label: "com.docker.compose.project=projeto-korp"
+  register: containers_ativos
+
+- name: Exibir o estado dos containers
+  ansible.builtin.debug:
+    msg: >-
+      {{ nome_container }} — {{ item.State | default('?') }}
+      ({{ item.Status | default('?') }})
+  vars:
+    # A API do Docker devolve `Names` (lista); versões do módulo já
+    # normalizaram para `Name`. O default cobre os dois formatos.
+    nome_container: "{{ (item.Names | default([item.Name | default('?')])) | join(', ') }}"
+  loop: "{{ containers_ativos.containers | default([]) }}"
+  loop_control:
+    label: "{{ nome_container }}"

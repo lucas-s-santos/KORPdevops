@@ -1,0 +1,11 @@
+# Tudo que não precisa ir para o contexto de build (build mais rápido e
+# sem risco de vazar arquivo local para dentro da imagem).
+.git
+.gitignore
+*.md
+Dockerfile
+.dockerignore
+bin/
+dist/
+*.test
+coverage.out

@@ -1,0 +1,19 @@
+# Provisionamento do datasource. Com este arquivo o Grafana já sobe apontando
+# para o Prometheus — nada é configurado pela interface, então o ambiente é
+# reprodutível e versionado em Git.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    # O uid é fixo de propósito: o JSON do dashboard referencia este valor.
+    uid: prometheus
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      # Deve casar com o scrape_interval do Prometheus para que o Grafana
+      # escolha passos de consulta coerentes nos gráficos.
+      timeInterval: 15s
+      httpMethod: POST
