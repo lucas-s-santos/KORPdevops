@@ -6,7 +6,9 @@
 # O site.yml também instala o que estiver faltando automaticamente, para que
 # o ambiente suba com um único comando.
 collections:
+  # 3.6.0 é o mínimo real: é a versão que introduziu
+  # docker_image_build (build via buildx/BuildKit) e docker_compose_v2.
   - name: community.docker
-    version: ">=3.10.0"
+    version: ">=3.6.0"
   - name: community.general
     version: ">=8.0.0"

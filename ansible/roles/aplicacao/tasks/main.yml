@@ -65,33 +65,32 @@
       GRAFANA_PASSWORD={{ grafana_senha }}
   register: env_gerado
 
-- name: Verificar se a imagem já existe no host
-  community.docker.docker_image_info:
-    name: "{{ imagem_nome }}:{{ imagem_tag }}"
-  register: imagem_existente
-
-# `docker_image` com source=build usa a API do daemon. Os testes Go rodam
-# dentro do próprio Dockerfile, então um build que passa já significa suíte
-# verde — não existe imagem publicada com teste quebrado.
+# `docker_image_build` executa `docker buildx build`, ou seja, com BuildKit.
+#
+# O módulo `docker_image` (source=build) NÃO serve aqui: ele chama o endpoint
+# /build da API do daemon, que é sempre o builder clássico, e o Dockerfile usa
+# `RUN --mount=type=cache` — sintaxe exclusiva do BuildKit. A opção
+# `features.buildkit` do daemon.json só muda o padrão da CLI, não da API.
+#
+# Os testes Go rodam dentro do próprio Dockerfile, então um build que passa já
+# significa suíte verde — não existe imagem publicada com teste quebrado.
 - name: Construir a imagem {{ imagem_nome }}:{{ imagem_tag }}
-  community.docker.docker_image:
+  community.docker.docker_image_build:
     name: "{{ imagem_nome }}"
     tag: "{{ imagem_tag }}"
-    source: build
-    force_source: "{{ fonte_copiada is changed }}"
-    build:
-      path: "{{ projeto_dir }}/app"
-      dockerfile: Dockerfile
-      pull: true
-      args:
-        VERSION: "{{ servico_versao }}"
-        COMMIT: "{{ commit_atual | default('ansible', true) }}"
-        BUILD_DATE: "{{ ansible_date_time.iso8601 }}"
-      labels:
-        projeto: projeto-korp
-        gerenciado_por: ansible
-    state: present
-  when: imagem_existente.images | length == 0 or fonte_copiada is changed
+    path: "{{ projeto_dir }}/app"
+    dockerfile: Dockerfile
+    pull: true
+    # `never` só constrói se a imagem não existir; quando o código-fonte muda,
+    # força a reconstrução. É o que mantém a role idempotente.
+    rebuild: "{{ 'always' if fonte_copiada is changed else 'never' }}"
+    args:
+      VERSION: "{{ servico_versao }}"
+      COMMIT: "{{ commit_atual | default('ansible', true) }}"
+      BUILD_DATE: "{{ ansible_date_time.iso8601 }}"
+    labels:
+      projeto: projeto-korp
+      gerenciado_por: ansible
   register: build_imagem
 
 # docker_image_tag em vez de docker_image com `repository`: a segunda forma
