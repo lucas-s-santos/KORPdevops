@@ -5,17 +5,26 @@
 
 # Carimbar o commit na imagem é o que permite, olhando o painel
 # "Versão em execução" do Grafana, saber exatamente qual código está no ar.
-- name: Descobrir o commit atual do repositório
-  ansible.builtin.command: "git -C {{ raiz_repositorio }} rev-parse --short HEAD"
-  register: git_commit
+- name: Descobrir o commit e a data do commit
+  ansible.builtin.command: "git -C {{ raiz_repositorio }} show -s --format=%h|%cI HEAD"
+  register: git_info
   changed_when: false
   failed_when: false
   become: false
   delegate_to: localhost
 
+# A data do build vem do COMMIT, não do relógio da execução.
+#
+# Tirá-la do horário atual teria dois efeitos ruins: o .env mudaria a cada
+# execução, a tarefa voltaria sempre "changed" e a idempotência que este
+# playbook promete deixaria de valer; e o mesmo commit produziria metadados
+# diferentes a cada build. Amarrada ao commit, a imagem fica reproduzível.
 - name: Definir a identificação do build
   ansible.builtin.set_fact:
-    commit_atual: "{{ git_commit.stdout | default('ansible', true) | trim or 'ansible' }}"
+    commit_atual: "{{ partes[0] | default('ansible', true) | trim or 'ansible' }}"
+    data_build: "{{ partes[1] | default('', true) | trim or '1970-01-01T00:00:00Z' }}"
+  vars:
+    partes: "{{ (git_info.stdout | default('', true) | trim).split('|') }}"
 
 - name: Criar a árvore de diretórios da stack
   ansible.builtin.file:
@@ -60,7 +69,7 @@
       # Gerado pelo Ansible — não editar à mão.
       APP_VERSION={{ servico_versao }}
       APP_COMMIT={{ commit_atual | default('ansible', true) }}
-      APP_BUILD_DATE={{ ansible_date_time.iso8601 }}
+      APP_BUILD_DATE={{ data_build }}
       GRAFANA_USER={{ grafana_usuario }}
       GRAFANA_PASSWORD={{ grafana_senha }}
   register: env_gerado
@@ -87,7 +96,7 @@
     args:
       VERSION: "{{ servico_versao }}"
       COMMIT: "{{ commit_atual | default('ansible', true) }}"
-      BUILD_DATE: "{{ ansible_date_time.iso8601 }}"
+      BUILD_DATE: "{{ data_build }}"
     labels:
       projeto: projeto-korp
       gerenciado_por: ansible
