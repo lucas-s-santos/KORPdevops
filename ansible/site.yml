@@ -15,11 +15,6 @@
   become: true
   gather_facts: true
 
-  vars:
-    colecoes_necessarias:
-      - community.docker
-      - community.general
-
   pre_tasks:
     - name: Conferir se a distribuição é suportada
       ansible.builtin.assert:
@@ -32,24 +27,19 @@
         success_msg: "{{ ansible_distribution }} {{ ansible_distribution_version }} — suportada."
       tags: [sempre, checagem]
 
-    # As roles usam módulos da coleção community.docker. Instalar aqui, se
-    # faltar, é o que permite cumprir o requisito de "um único comando":
-    # quem clona o repositório não precisa lembrar do ansible-galaxy.
-    - name: Verificar coleções do Ansible Galaxy já instaladas
-      ansible.builtin.command: ansible-galaxy collection list
-      register: colecoes_instaladas
-      changed_when: false
-      failed_when: false
-      become: false
-      delegate_to: localhost
-      run_once: true
-      tags: [sempre, checagem]
-
-    - name: Instalar coleções ausentes
-      ansible.builtin.command: "ansible-galaxy collection install {{ item }}"
-      loop: "{{ colecoes_necessarias }}"
-      when: item not in (colecoes_instaladas.stdout | default(''))
-      changed_when: true
+    # As roles usam módulos recentes de community.docker (docker_image_build,
+    # docker_compose_v2 com wait). Instalar A PARTIR do requirements.yml — em
+    # vez de checar apenas se o nome da coleção existe — é o que garante a
+    # VERSÃO: o pacote `ansible` do Ubuntu 24.04 traz a 3.7.0, que passaria
+    # numa checagem por nome e quebraria depois, no meio do provisionamento.
+    #
+    # É também o que sustenta o requisito de "um único comando": quem clona o
+    # repositório não precisa lembrar de rodar ansible-galaxy antes.
+    - name: Instalar as coleções do Galaxy nas versões exigidas
+      ansible.builtin.command:
+        cmd: "ansible-galaxy collection install -r {{ playbook_dir }}/requirements.yml"
+      register: instalacao_colecoes
+      changed_when: "'Nothing to do' not in instalacao_colecoes.stdout"
       become: false
       delegate_to: localhost
       run_once: true
