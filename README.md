@@ -89,15 +89,42 @@ sudo dnf install -y ansible-core git curl
 
 ### Rodando no Windows
 
-O Ansible não roda nativamente no Windows. Use o WSL2:
+O Ansible não roda nativamente no Windows como nó de controle. Use o WSL2:
 
 ```powershell
-wsl --install -d Ubuntu     # depois reinicie e crie seu usuário
+wsl --install -d Ubuntu-24.04
 ```
 
-Em seguida, dentro do Ubuntu do WSL, siga o fluxo normal do Linux.
-Depois de subir a stack, `http://localhost/projeto-korp` funciona também
-no navegador do Windows — o WSL2 encaminha as portas automaticamente.
+Se o comando responder que é preciso reiniciar, **reinicie e rode de novo** —
+a primeira execução apenas habilita o recurso do Windows, sem instalar a
+distribuição.
+
+Dentro do Ubuntu, habilite o **systemd** antes de qualquer coisa. O playbook
+gerencia o Docker por `ansible.builtin.systemd`, e sem isso ele falha:
+
+```bash
+sudo tee /etc/wsl.conf >/dev/null <<'EOF'
+[boot]
+systemd=true
+EOF
+```
+
+Depois, no PowerShell, `wsl --shutdown` e abra o Ubuntu de novo. Confirme com
+`ps -p 1 -o comm=`, que deve responder `systemd`. A partir daí, siga o fluxo
+normal do Linux.
+
+Clone o repositório **dentro do filesystem do Linux** (`~/projeto-korp`), não
+em `/mnt/c`: o acesso ao disco do Windows via 9p deixa o build da imagem
+lento e ignora os finais de linha LF que o `.gitattributes` exige.
+
+Com a stack no ar, `http://localhost/projeto-korp` funciona também no
+navegador do Windows — o WSL2 encaminha as portas automaticamente.
+
+> **Atenção:** o WSL desliga a VM pouco depois que a última sessão se
+> desconecta, e os containers caem junto. Deixe um terminal do Ubuntu aberto
+> enquanto estiver usando o ambiente. Ao religar, a stack volta sozinha:
+> o `docker.service` fica habilitado no boot e os containers usam
+> `restart: unless-stopped`.
 
 ---
 

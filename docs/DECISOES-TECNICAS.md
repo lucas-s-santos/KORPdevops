@@ -370,12 +370,34 @@ máquina.
 - `daemon.json` é validado com `validate:` **antes** de ser gravado: um JSON
   quebrado impediria o daemon de subir, e aí não haveria mais Docker para
   consertar nada.
+- A data de build vem do **commit** (`git show -s --format=%cI`), não do
+  relógio da execução. Tirá-la de `ansible_date_time` faria o `.env` mudar em
+  toda execução e a tarefa voltar sempre `changed`, quebrando a idempotência
+  que esta seção afirma. De quebra, amarrar ao commit torna a imagem
+  reproduzível: o mesmo commit sempre gera os mesmos metadados.
 
-### 7.4 Instalação automática das coleções
+### 7.4 Instalação automática das coleções — e por que ela não basta
 
-O `site.yml` verifica e instala `community.docker` se faltar. É o que permite
-cumprir literalmente o requisito de "um único comando": quem clona o
-repositório não precisa lembrar do `ansible-galaxy`.
+O `site.yml` instala as coleções a partir do `requirements.yml`, para que quem
+clona o repositório não precise lembrar do `ansible-galaxy`.
+
+Só que isso tem um limite que vale conhecer: **uma coleção instalada durante a
+execução não passa a valer no processo em curso**. O carregador de plugins do
+Ansible já resolveu a versão presente no início do play, e continua usando
+aquela até o fim. Numa máquina onde o `apt install ansible` deixou uma
+`community.docker` antiga, instalar uma mais nova no `pre_tasks` não muda nada
+para as roles que vêm depois.
+
+A consequência prática: o playbook **não pode depender de recursos acima da
+versão que a distribuição já entrega**, ou o requisito de "um único comando"
+falha justamente numa máquina recém-instalada — o cenário mais provável numa
+avaliação.
+
+É por isso que a role `stack` espera os containers com `docker_container_info`
+em vez de usar a opção `wait` do `docker_compose_v2`: `wait` só existe a partir
+da 3.9.0, e o Ubuntu 24.04 entrega a 3.7.0. A espera explícita ainda rende um
+erro melhor — diz **qual** container não ficou saudável, em vez de estourar um
+timeout genérico do Compose.
 
 ### 7.5 A validação falha o playbook
 
