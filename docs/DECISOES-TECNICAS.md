@@ -412,19 +412,242 @@ Se qualquer uma dessas afirmações falhar, o playbook falha. "Provisionou" e
 
 ---
 
-## 8. O que eu faria diferente em produção
+## 8. Alertas, SLO e notificação
+
+Esta parte não estava no enunciado. Foi construída depois, porque o projeto
+tinha cinco regras de alerta que **disparavam e não avisavam ninguém**: não
+existia bloco `alerting:` no `prometheus.yml` nem Alertmanager na stack. É a
+falha mais silenciosa que um ambiente de monitoramento pode ter — tudo parece
+configurado, a interface fica vermelha, e o incidente passa despercebido.
+
+### 8.1 Alertmanager como peça separada
+
+**Feito:** o Prometheus avalia as regras e encaminha para um Alertmanager, que
+agrupa, inibe, silencia e entrega.
+
+**Por quê:** são responsabilidades diferentes. O Prometheus sabe *quando* uma
+condição é verdadeira; ele não sabe nada sobre quem está de plantão, o que já
+foi avisado, o que está silenciado durante uma manutenção, nem quais alertas
+são redundantes entre si. Juntar as duas coisas num processo só transformaria
+qualquer mudança de política de notificação num reload do coletor de métricas.
+
+**Descartado:** alertas do próprio Grafana (Grafana Alerting). Funcionam, mas
+prendem a regra no banco do Grafana em vez de deixá-la em Git ao lado do
+código, e o que se ganha em conveniência de interface se perde em revisão por
+pull request.
+
+### 8.2 Agrupamento e inibição
+
+**Feito:** `group_by: [alertname, severidade]` com `group_wait` de 30s, e duas
+`inhibit_rules` que suprimem os sintomas quando a causa já foi notificada.
+
+**Por quê:** quando a aplicação cai, quatro alertas disparam quase juntos —
+serviço fora, caminho fim-a-fim falhando, taxa de 5xx e latência. São quatro
+mensagens sobre **um** incidente, chegando exatamente no momento em que a
+pessoa de plantão precisa de clareza. A inibição entrega a causa e segura o
+resto.
+
+O efeito prático é o que sustenta o resto do sistema: um canal que só toca
+quando importa continua sendo lido. Um canal que toca quatro vezes por
+incidente é silenciado pela equipe em duas semanas, e aí nem o alerta bom
+chega.
+
+**Descartado:** a regra genérica "severidade crítica inibe severidade aviso".
+É o exemplo mais citado na documentação, mas aqui os alertas agregados
+(`sum(...)`) perdem as labels de serviço, e o `equal:` casaria rótulo ausente
+com rótulo ausente — na prática, qualquer alerta crítico apagaria todos os
+avisos do ambiente, inclusive os que não têm relação nenhuma com ele.
+
+### 8.3 Taxa de queima, não apenas limiar
+
+**Feito:** os alertas de limiar continuam (`alertas-projeto-korp.yml`), e ao
+lado deles entraram alertas baseados no consumo do orçamento de erro
+(`slo-projeto-korp.yml`).
+
+**Por quê:** limiar puro erra dos dois lados. Dispara em pico de trinta
+segundos que se resolve sozinho, e fica quieto durante uma degradação lenta de
+0,5% de erro que, ao fim do mês, estourou o compromisso inteiro. A taxa de
+queima mede a coisa certa: a velocidade com que a confiabilidade prometida
+está sendo gasta.
+
+```
+SLO 99,9% em 30 dias  ->  orçamento de erro = 0,1% = ~43 min por mês
+
+queima  1x  -> consome o orçamento exatamente no prazo
+queima  6x  -> acaba em ~5 dias
+queima 14,4x -> acaba em ~2 dias
+```
+
+**Descartado:** trocar os alertas de limiar pelos de queima. Os dois tipos
+respondem a perguntas diferentes — "isto quebrou agora" e "vamos cumprir o
+combinado no fim do mês" — e um não substitui o outro.
+
+### 8.4 Duas janelas por alerta
+
+**Feito:** cada alerta de queima exige que uma janela longa **e** uma curta
+estejam acima do limiar ao mesmo tempo (1h com 5m, 6h com 30m).
+
+**Por quê:** a janela longa dá confiança de que o problema é real, e não um
+pico. A curta é o que faz o alerta **limpar sozinho** depois que o problema
+passa. Sem ela, um incidente de dez minutos deixa o alerta ativo pelo resto da
+janela longa, porque a média continua suja — e alerta que não se resolve
+sozinho é alerta que a equipe aprende a ignorar.
+
+### 8.5 Dead man's switch
+
+**Feito:** `PipelineDeAlertasViva`, cuja expressão é `vector(1)` — sempre
+verdadeira. Dispara para sempre, de propósito, e é roteada para o notificador
+a cada cinco minutos.
+
+**Por quê:** todo alerta deste projeto compartilha um ponto único de falha: o
+próprio Prometheus. Se ele cair, nenhum alerta chega — e um canal silencioso é
+**indistinguível** de um canal saudável. Quem está de plantão não tem como
+saber a diferença entre "nada quebrou" e "o monitoramento morreu".
+
+O watchdog inverte o sinal: enquanto ele chega, a corrente inteira está
+provada (regra avaliada, Alertmanager roteando, webhook entregue). O silêncio
+dele é o alarme.
+
+**Descartado:** confiar apenas em `up{job="prometheus"}`. Um Prometheus que
+raspa a si mesmo e reporta que está vivo não prova nada sobre o Alertmanager
+nem sobre a entrega do webhook — e, se ele estiver fora, também não há quem
+avalie essa regra.
+
+### 8.6 Notificador próprio em vez de `discord_configs`
+
+**Feito:** um serviço de ~250 linhas de Python (biblioteca padrão apenas) que
+recebe o webhook do Alertmanager, registra o alerta em log estruturado, conta
+numa métrica e repassa ao Discord.
+
+**Por quê:** três motivos, em ordem de peso.
+
+1. **O segredo.** O Alertmanager não expande variáveis de ambiente no arquivo
+   de configuração. Usar o receiver nativo obrigaria a commitar a URL do
+   webhook em texto puro no YAML, ou a gerar esse YAML por template — na
+   primeira opção o segredo vai para o Git, na segunda o arquivo versionado
+   deixa de ser o que roda. Com o notificador, a URL vive só no `.env`.
+
+2. **O alerta vira dado.** `korp_alertas_recebidos_total` transforma cada
+   disparo em série temporal, e o log estruturado deixa a trilha. Sem isso, um
+   alerta que toca e some não deixa histórico — e depois do incidente ninguém
+   reconstrói o que avisou o quê, nem em que ordem.
+
+3. **Trocar o destino** (Telegram, PagerDuty, um webhook interno) passa a ser
+   uma mudança num arquivo Python, sem tocar na configuração do Alertmanager.
+
+**Descartado:** `discord_configs` nativo (pelo problema do segredo) e a
+biblioteca `prometheus_client` (seria a única dependência da imagem; o formato
+de exposição é texto simples e tem trinta linhas de gerador).
+
+**Custo assumido:** é mais uma peça para manter, e um Python a mais num
+projeto Go. Vale pelo item 1 sozinho.
+
+### 8.7 O notificador sempre responde 200
+
+**Feito:** mesmo quando o envio ao Discord falha, o webhook devolve 200, e a
+exceção é registrada e contabilizada.
+
+**Por quê:** em erro, o Alertmanager reenfileira e repete o **lote inteiro**.
+Devolver erro por causa de um 429 do Discord produziria alertas duplicados no
+canal — e o envio já ficou registrado no log e na métrica de qualquer forma.
+Um notificador que morre por causa da instabilidade do destino é pior que um
+envio perdido: dali em diante, nenhum alerta chega.
+
+### 8.8 Retenção de 31 dias no Prometheus
+
+**Feito:** `--storage.tsdb.retention.time=31d`, um dia a mais que a janela do
+SLO.
+
+**Por quê:** com os 15 dias anteriores, a regra que calcula a disponibilidade
+de 30 dias faria a média de **meia** janela e reportaria um número otimista —
+e um SLO que mente é pior que um SLO que não existe.
+
+---
+
+## 9. Logs
+
+### 9.1 Loki em modo de nó único
+
+**Feito:** um processo com tudo dentro (ingester, distributor, querier,
+compactor), chunks em disco, schema TSDB v13, retenção de 7 dias.
+
+**Por quê:** o modo distribuído só faz sentido com vários nós e um object
+store de verdade (S3, GCS); num host só, ele adiciona componentes sem
+adicionar disponibilidade. A retenção é menor que a das métricas de propósito:
+métrica é barata e responde perguntas sobre tendência; log é caro e responde
+perguntas sobre o passado recente.
+
+**Descartado:** ELK. Resolve o mesmo problema, mas pede um Elasticsearch — que
+sozinho consome mais memória que esta stack inteira — e indexa o conteúdo das
+linhas. O Loki indexa só as labels e guarda o resto comprimido, o que é a
+troca certa quando a busca quase sempre começa por "qual serviço, qual
+janela".
+
+### 9.2 Descoberta pela API do Docker, não por glob no disco
+
+**Feito:** `docker_sd_configs` no Promtail, filtrando pela label do projeto.
+
+**Por quê:** por glob em `/var/lib/docker/containers/*/*-json.log`, o único
+identificador disponível é o ID do container — um hash que muda a cada
+recriação. Os painéis do Grafana quebrariam no primeiro
+`docker compose up --force-recreate`. Pela API vêm o nome e as labels do
+Compose, e o painel pode filtrar por `servico="nginx"` para sempre.
+
+### 9.3 Cardinalidade das labels
+
+**Feito:** só `container`, `servico`, `ambiente`, `origem` e `level` viram
+label. `msg`, `alerta` e o resto ficam no corpo da linha.
+
+**Por quê:** no Loki, cada combinação distinta de labels cria um fluxo
+separado, com seus próprios chunks e índice. Promover um campo de alta
+cardinalidade (ID de requisição, IP, path com parâmetro) multiplica os fluxos
+por milhares e derruba o Loki — é o erro mais comum de quem vem do
+Elasticsearch, onde indexar tudo é o comportamento normal.
+
+### 9.4 O socket do Docker atrás de um proxy
+
+**Feito:** o Promtail fala com um `docker-socket-proxy` que só libera leitura
+(`CONTAINERS=1`, `NETWORKS=1`, `POST=0`); só o proxy tem o socket montado.
+
+**Por quê:** montar `/var/run/docker.sock` num container é equivalente a dar
+root no host para ele — quem fala com o socket cria container privilegiado e
+monta o filesystem inteiro. E o Promtail é justamente o processo que parseia
+conteúdo não confiável (linhas de log), ou seja, o que menos deveria ter esse
+poder.
+
+O `:ro` no mount do socket é cosmético e não conta como mitigação: a restrição
+se aplica ao arquivo, não às chamadas de API que passam por ele. O proxy é a
+mitigação real, e o teste de aceitação verifica que o Promtail não tem o
+socket montado.
+
+**Custo assumido:** mais um container na stack. Em troca, o componente que lê
+dado não confiável perde a capacidade de criar containers.
+
+### 9.5 Horário do registro, não da coleta
+
+**Feito:** `pipeline_stages` extrai o campo `time` do JSON do `slog` e o usa
+como timestamp da linha.
+
+**Por quê:** sem isso, a linha entra no Loki com a hora em que o Promtail a
+leu. Um atraso de coleta desloca o log em relação à métrica, e a correlação no
+Grafana — que é a razão de existir de ter os dois no mesmo lugar — passa a
+mentir justamente durante um incidente, que é quando o atraso é maior.
+
+---
+
+## 10. O que eu faria diferente em produção
 
 Sendo honesto sobre os limites deste desafio:
 
 | Aqui | Em produção |
 |---|---|
-| Senha do Grafana em texto no `group_vars` | Ansible Vault, ou um cofre externo (Vault, AWS Secrets Manager) |
+| Senha do Grafana em texto no `group_vars`; webhook do Discord no `.env` | Ansible Vault, ou um cofre externo (Vault, AWS Secrets Manager) |
 | HTTP puro na porta 80 | TLS com certificado gerenciado, redirecionamento 301, HSTS |
 | Prometheus com armazenamento local | Thanos ou Mimir para retenção longa e alta disponibilidade |
-| Alertas só visíveis na UI | Alertmanager com rotas para Slack/PagerDuty e silenciamento |
+| Um Alertmanager só | Três em cluster, que deduplicam entre si — hoje ele é ponto único de falha bem na hora que importa |
 | Uma réplica da aplicação | Várias réplicas atrás de um balanceador, deploy sem downtime |
-| Logs no `json-file` local | Coleta centralizada (Loki, ELK) com retenção e busca |
-| Sem rastreamento distribuído | OpenTelemetry, para correlacionar log, métrica e trace |
+| Loki gravando em disco local | Object store (S3/GCS) e Loki distribuído, para retenção longa e busca sob carga |
+| Log e métrica correlacionados por tempo e serviço | OpenTelemetry com trace ID propagado, para correlacionar por requisição |
 | Compose num host único | Kubernetes ou ECS, com autoescala e agendamento |
 | Testes dentro do Dockerfile | Estágio dedicado no CI, com relatório de cobertura e SAST |
 | Imagem construída no alvo | Registry privado, imagem assinada, varredura de vulnerabilidades |

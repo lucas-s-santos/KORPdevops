@@ -1,24 +1,38 @@
 # Projeto Korp
 
 Serviço HTTP em Go, containerizado, atrás de um proxy reverso NGINX, com
-observabilidade completa (Prometheus + Grafana) e provisionamento inteiro
-automatizado por um único comando Ansible.
+observabilidade completa — métricas, alertas que **chegam a alguém**, SLO com
+orçamento de erro e logs no mesmo Grafana — e o ambiente inteiro provisionado
+por um único comando Ansible.
 
 ```
-                    ┌──────────────────────── host ────────────────────────┐
-                    │                                                       │
-   curl :80 ───────►│  :80    NGINX  ──────┐                                │
-                    │                      │  rede bridge korp-net          │
-   navegador :3000 ►│  :3000  Grafana      │  (172.28.0.0/16)               │
-                    │            │         ▼                                │
-   navegador :9090 ►│  :9090  Prometheus ──► http-server-projeto-korp:8080  │
-                    │            │              (sem porta no host)         │
-                    │            ├──────────► nginx-exporter:9113           │
-                    │            └──────────► blackbox-exporter:9115 ──┐    │
-                    │                                                  │    │
-                    │                    sonda o caminho real ─────────┘    │
-                    └───────────────────────────────────────────────────────┘
+            ┌──────────────────────────── host ────────────────────────────┐
+            │                                                              │
+ curl :80 ─►│  :80   NGINX ────────┐                                       │
+            │                      │   rede bridge korp-net                │
+  nav :3000►│  :3000 Grafana       │   (172.28.0.0/16)                     │
+            │          │           ▼                                       │
+            │          │      http-server-projeto-korp:8080                │
+            │          │           (sem porta publicada no host)           │
+  nav :9090►│  :9090 Prometheus ──► nginx-exporter:9113                    │
+            │          │       └──► blackbox-exporter:9115 ──┐             │
+            │          │                                     │             │
+            │          │              sonda o caminho real ──┘             │
+            │          │                                                   │
+            │          ▼  regra dispara                                    │
+  nav :9093►│  :9093 Alertmanager ──► notificador:9094 ──► Discord          │
+            │          agrupa, inibe        │  vira log + métrica          │
+            │                               ▼                              │
+            │  todos os containers ──► promtail ──► loki:3100 ──► Grafana  │
+            │       (logs)              via docker-socket-proxy            │
+            └──────────────────────────────────────────────────────────────┘
 ```
+
+O caminho de um alerta, do sintoma ao celular, é uma corrente de seis elos —
+e o projeto valida a corrente inteira, não só as pontas:
+
+**métrica → regra avaliada → Alertmanager roteia → webhook entregue →
+notificação no Discord → o próprio alerta vira log e métrica**
 
 ---
 
@@ -32,6 +46,8 @@ automatizado por um único comando Ansible.
 - [Estrutura do repositório](#estrutura-do-repositório)
 - [O serviço HTTP](#o-serviço-http)
 - [Observabilidade](#observabilidade)
+- [Alertas e SLO](#alertas-e-slo)
+- [Logs](#logs)
 - [O playbook Ansible](#o-playbook-ansible)
 - [Decisões técnicas](#decisões-técnicas)
 - [Solução de problemas](#solução-de-problemas)
@@ -52,19 +68,35 @@ automatizado por um único comando Ansible.
 | `curl http://localhost:80/projeto-korp` funciona | [scripts/teste-aceitacao.sh](scripts/teste-aceitacao.sh) | ✅ |
 | Métrica de disponibilidade | `korp_service_up`, `up`, `probe_success` | ✅ três camadas |
 | Métrica de volume de requisições | `korp_http_requests_total` | ✅ |
-| Prometheus coletando as métricas | [prometheus/prometheus.yml](prometheus/prometheus.yml) | ✅ 5 jobs |
+| Prometheus coletando as métricas | [prometheus/prometheus.yml](prometheus/prometheus.yml) | ✅ 9 jobs |
 | Grafana visualizando | [grafana/](grafana/) | ✅ |
 | Dashboard de análise do serviço | [dashboard JSON](grafana/dashboards/http-server-projeto-korp-dashboard.json) | ✅ 14 painéis |
 | Playbook Ansible completo | [ansible/site.yml](ansible/site.yml) | ✅ 7 roles |
 | Validação HTTP com resposta no console | [ansible/roles/validacao/](ansible/roles/validacao/tasks/main.yml) | ✅ |
 | **Bônus:** Grafana provisionado por arquivo | `datasources.yml`, `dashboards.yml`, JSON | ✅ zero cliques |
 
+Depois de entregue o que o desafio pedia, o projeto continuou. O que veio
+em seguida trata a parte que faltava: o alerta que dispara e não avisa
+ninguém.
+
+| Além do desafio | Onde está |
+|---|---|
+| Alertmanager agrupando, inibindo e roteando por severidade | [alertmanager/](alertmanager/alertmanager.yml) |
+| Notificação no Discord, com o segredo fora do Git | [notificador/](notificador/notificador.py) |
+| Alerta vira log estruturado **e** métrica (`korp_alertas_recebidos_total`) | [notificador/](notificador/notificador.py) |
+| *Dead man's switch*: um alerta que monitora o monitoramento | [slo-projeto-korp.yml](prometheus/rules/slo-projeto-korp.yml) |
+| SLO de 99,9% com orçamento de erro e taxa de queima multi-janela | [slo-projeto-korp.yml](prometheus/rules/slo-projeto-korp.yml) |
+| Logs no Grafana, ao lado das métricas (Loki + Promtail) | [loki/](loki/loki-config.yml), [promtail/](promtail/promtail-config.yml) |
+| Socket do Docker atrás de um proxy só-leitura | [docker-compose.yml](docker-compose.yml) |
+| Segundo dashboard: SLO, alertas e logs | [dashboard de SLO](grafana/dashboards/slo-projeto-korp-dashboard.json) |
+| O playbook **prova** que o alerta chega ao destino | [roles/validacao/](ansible/roles/validacao/tasks/main.yml) |
+
 Extras que foram além do mínimo pedido: testes automatizados em Go rodando
 dentro do build da imagem, healthchecks em todos os containers, endurecimento
 de segurança dos containers (não-root, `read_only`, `cap_drop: ALL`),
 blackbox-exporter para disponibilidade fim-a-fim, exporter do NGINX, regras
 de alerta, rotação de logs, encerramento gracioso, limites de recursos,
-script de teste de aceitação e pipeline de CI.
+script de teste de aceitação (55 verificações) e pipeline de CI.
 
 ---
 
@@ -263,15 +295,23 @@ projeto-korp/
 │   └── http-server-projeto-korp.conf # proxy reverso (volume montado)
 │
 ├── prometheus/
-│   ├── prometheus.yml                # jobs de coleta
-│   └── rules/                        # regras de alerta
+│   ├── prometheus.yml                # jobs de coleta + alvo do Alertmanager
+│   └── rules/
+│       ├── alertas-projeto-korp.yml  #   alertas por limiar
+│       └── slo-projeto-korp.yml      #   SLO, taxa de queima e watchdog
+│
+├── alertmanager/alertmanager.yml     # agrupamento, inibição e roteamento
+├── notificador/notificador.py        # webhook -> log + métrica + Discord
+│
+├── loki/loki-config.yml              # armazenamento dos logs
+├── promtail/promtail-config.yml      # coleta dos logs dos containers
 │
 ├── blackbox/blackbox.yml             # como sondar o serviço de fora
 │
 ├── grafana/
-│   ├── provisioning/datasources/     # datasources.yml
+│   ├── provisioning/datasources/     # datasources.yml (Prometheus + Loki)
 │   ├── provisioning/dashboards/      # dashboards.yml
-│   └── dashboards/*.json             # dashboard versionado
+│   └── dashboards/*.json             # dashboards versionados (operação, SLO)
 │
 ├── ansible/
 │   ├── site.yml                      # playbook principal
@@ -282,9 +322,9 @@ projeto-korp/
 │       ├── rede/                     # rede bridge
 │       ├── aplicacao/                # código + build da imagem
 │       ├── nginx/                    # proxy reverso
-│       ├── monitoramento/            # Prometheus, Grafana, Blackbox
+│       ├── monitoramento/            # Prometheus, Grafana, alertas, logs
 │       ├── stack/                    # docker compose up
-│       └── validacao/                # requisição HTTP + saída no console
+│       └── validacao/                # requisição HTTP + cadeia de alertas
 │
 ├── scripts/teste-aceitacao.sh        # verificação fim-a-fim
 ├── docker-compose.yml
@@ -383,9 +423,13 @@ de cardinalidade.
 | `nginx_*` | vários | Conexões e requisições no proxy |
 | `probe_*` | vários | Disponibilidade e latência fim-a-fim |
 
-### O dashboard
+### Os dashboards
 
-14 painéis, agrupados por pergunta:
+São dois. O de **operação** (`/d/projeto-korp`) responde "como o serviço está
+agora"; o de **SLO** (`/d/projeto-korp-slo`) responde "estamos cumprindo o
+que prometemos, e o alerta chegaria se não estivéssemos".
+
+O de operação tem 14 painéis, agrupados por pergunta:
 
 1. **Está no ar?** — cartões de `up`, `probe_success` e SLA da janela
 2. **Quanto tráfego?** — req/s por rota, total acumulado, por status
@@ -394,17 +438,154 @@ de cardinalidade.
 5. **Está saturado?** — requisições em voo, goroutines, heap
 6. **Qual versão?** — tabela com `korp_build_info`
 
+O de SLO tem 12, descritos em [Alertas e SLO](#alertas-e-slo).
+
 Cada painel tem uma descrição (ícone de informação no canto) explicando a
 consulta PromQL por trás — feito para ser lido por quem vai operar, não só por
 quem construiu.
 
-### Alertas
+---
 
-Cinco regras em [prometheus/rules/](prometheus/rules/), visíveis em
-`http://localhost:9090/alerts`: serviço indisponível, caminho fim-a-fim
-falhando, taxa de 5xx acima de 5%, latência p95 acima de 500 ms e sumiço da
-métrica de saúde. Num ambiente real, um Alertmanager encaminharia para
-Slack ou PagerDuty.
+## Alertas e SLO
+
+O desafio pedia métrica e dashboard, e isso ficou pronto. Mas um dashboard só
+funciona enquanto alguém está olhando para ele, e às 3h da manhã ninguém está.
+Esta parte fecha esse buraco.
+
+### O que estava faltando
+
+O projeto já tinha cinco regras de alerta escritas. Elas **disparavam e
+morriam na tela do Prometheus** — não havia bloco `alerting:` no
+`prometheus.yml` e não havia Alertmanager na stack. É a falha mais silenciosa
+possível: tudo parece configurado, o alerta fica vermelho na interface, e
+ninguém é avisado.
+
+### A cadeia completa
+
+```
+korp_http_requests_total          a aplicação expõe
+        │
+        ▼
+Prometheus avalia prometheus/rules/*.yml        a cada 15s
+        │
+        ▼
+Alertmanager   agrupa por (alertname, severidade)
+               inibe o sintoma quando a causa já foi notificada
+               roteia: critico -> 10s | alto/aviso -> 30s | watchdog -> 0s
+        │
+        ▼
+notificador    log estruturado + korp_alertas_recebidos_total
+        │
+        ├──► Discord (se DISCORD_WEBHOOK_URL estiver definida)
+        └──► Promtail -> Loki -> Grafana
+```
+
+### Três decisões que valem explicar
+
+**Inibição.** Quando a aplicação cai, quatro alertas disparam juntos:
+`ServicoIndisponivel`, `CaminhoFimAFimFalhando`, `TaxaDeErro5xxAlta` e
+`LatenciaP95Alta`. São quatro mensagens sobre um único incidente. As regras de
+`inhibit_rules` entregam só a primeira — a causa — e seguram os sintomas.
+
+**Taxa de queima, não só limiar.** Alerta por limiar ("p95 passou de 500 ms")
+dispara em pico que se resolve sozinho e não diz nada sobre quanto da
+confiabilidade prometida já foi gasta. Os alertas de
+[slo-projeto-korp.yml](prometheus/rules/slo-projeto-korp.yml) olham a
+velocidade com que o orçamento de erro está sendo consumido, com duas janelas
+simultâneas: a longa dá confiança de que o problema é real, a curta faz o
+alerta limpar sozinho quando passa.
+
+| SLO | Orçamento de erro | Queima 14,4x | Queima 1x |
+|---|---|---|---|
+| 99,9% em 30 dias | ~43 min por mês | acaba em 2 dias | acaba no prazo |
+
+**Dead man's switch.** `PipelineDeAlertasViva` é `vector(1)` — dispara sempre,
+de propósito. Ele não monitora o serviço: monitora o monitoramento. No dia em
+que o Prometheus cair, todos os outros alertas param de chegar, e um canal
+silencioso é indistinguível de um canal saudável. O silêncio *deste* alerta é
+o sinal.
+
+Ele **não** vai para o Discord — repetir a cada 5 minutos encheria o canal de
+ruído e treinaria a equipe a ignorar as notificações, matando justamente o
+alerta de verdade que aparecesse no meio. Fica no log e na métrica, que é onde
+o silêncio dele é detectável (`make notificacoes`).
+
+### Por que um notificador próprio e não `discord_configs`
+
+O Alertmanager não expande variáveis de ambiente no arquivo de configuração.
+Usar o receiver nativo do Discord obrigaria a commitar a URL do webhook em
+texto puro no YAML, ou a gerar esse YAML por template — no primeiro caso o
+segredo vaza para o Git, no segundo o arquivo versionado deixa de ser o que
+roda. Com um notificador próprio, o segredo vive só no `.env`, e o alerta
+ainda ganha log estruturado e métrica de quebra.
+
+Sem webhook configurado, nada quebra: o alerta continua virando log e métrica.
+É assim que o CI roda, sem precisar de credencial nenhuma.
+
+### Vendo funcionar
+
+A única prova honesta é um incidente de verdade:
+
+```bash
+make incidente        # para a aplicação de propósito
+# ~1 min depois:
+make alertas          # ServicoIndisponivel em "firing"
+make notificacoes     # o que chegou ao notificador
+make slo              # disponibilidade, orçamento e taxa de queima
+make fim-incidente    # religa; o alerta resolve em ~1 min
+```
+
+Repare no que **não** acontece: `LatenciaP95Alta` e `TaxaDeErro5xxAlta` não
+viram notificação. A inibição funcionou.
+
+Para receber no Discord: crie um webhook em *Configurações do canal >
+Integrações > Webhooks*, e coloque a URL em `DISCORD_WEBHOOK_URL` no `.env`
+(que está no `.gitignore`). Pelo Ansible:
+
+```bash
+ansible-playbook -i ansible/inventory.ini ansible/site.yml \
+  -e discord_webhook_url='https://discord.com/api/webhooks/...'
+```
+
+### O dashboard de SLO
+
+Em `http://localhost:3000/d/projeto-korp-slo`: disponibilidade contra o SLO,
+orçamento de erro restante, taxa de queima nas quatro janelas, histórico dos
+alertas entregues, a tabela dos alertas ativos e os logs — tudo na mesma tela.
+
+---
+
+## Logs
+
+Métrica responde *o que* quebrou. Log responde *por quê*. Estando os dois no
+mesmo Grafana, o caminho entre as duas perguntas é de dois cliques, sem trocar
+de ferramenta no meio de um incidente.
+
+- **Loki** guarda 7 dias de log (métrica é barata e fica 31 dias; log é caro).
+- **Promtail** descobre os containers pela API do Docker, o que dá labels pelo
+  **nome** do serviço — por glob no disco só existiria o ID, um hash que muda
+  a cada recriação.
+- O JSON do `slog` da aplicação é parseado, e `level` vira label. Campos de
+  alta cardinalidade (ID de requisição, IP, path com parâmetro) **não** viram
+  label: no Loki cada combinação de labels cria um fluxo, e é assim que se
+  derruba um Loki.
+
+### O socket do Docker
+
+Para descobrir containers pela API, o Promtail precisaria de
+`/var/run/docker.sock`. Montar o socket num container equivale a dar root no
+host para ele — quem fala com o socket cria container privilegiado e monta o
+filesystem inteiro.
+
+Por isso existe o `docker-socket-proxy` no meio, liberando só leitura do que o
+Promtail usa — `CONTAINERS=1` para listar e ler logs, `NETWORKS=1` porque a
+descoberta monta as labels `__meta_docker_network_*` — e bloqueando o resto
+(`POST=0`: não cria, não para, não executa). O teste de aceitação verifica que
+o Promtail **não** tem o socket montado.
+
+```bash
+make logs-loki        # últimas linhas da aplicação, lidas do Loki
+```
 
 ---
 

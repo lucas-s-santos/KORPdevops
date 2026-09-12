@@ -7,7 +7,7 @@ falar enquanto roda) e o **banco de perguntas** com respostas prontas.
 
 # Parte A — Roteiro da demonstração
 
-Tempo alvo: 10 a 12 minutos. Ensaie pelo menos uma vez inteiro antes.
+Tempo alvo: 14 a 16 minutos. Ensaie pelo menos uma vez inteiro antes.
 
 ## Antes de começar (5 minutos antes da chamada)
 
@@ -17,7 +17,7 @@ cd ~/projeto-korp
 make limpar          # derruba tudo, inclusive volumes e rede
 docker system prune -f
 
-# 2. Aqueça o cache de imagens (baixar 6 imagens ao vivo é tempo morto)
+# 2. Aqueça o cache de imagens (baixar 11 imagens ao vivo é tempo morto)
 docker pull nginx:1.27-alpine
 docker pull prom/prometheus:v2.55.1
 docker pull grafana/grafana:11.3.0
@@ -25,9 +25,18 @@ docker pull prom/blackbox-exporter:v0.25.0
 docker pull nginx/nginx-prometheus-exporter:1.3.0
 docker pull curlimages/curl:8.10.1
 docker pull golang:1.23-alpine
+docker pull prom/alertmanager:v0.27.0
+docker pull python:3.12-alpine
+docker pull grafana/loki:3.3.2
+docker pull grafana/promtail:3.3.2
+docker pull tecnativa/docker-socket-proxy:0.3.0
 
 # 3. Deixe abertos: terminal, navegador com as abas
-#    localhost/projeto-korp, localhost:9090, localhost:3000
+#    localhost/projeto-korp, localhost:9090, localhost:3000,
+#    localhost:9093 (Alertmanager) e localhost:3000/d/projeto-korp-slo
+#
+# 4. Se for demonstrar a notificação: DISCORD_WEBHOOK_URL no .env e o
+#    Discord aberto no celular, com o canal já na tela.
 ```
 
 ## Passo 1 — O problema, em uma frase (30 s)
@@ -158,7 +167,79 @@ Tudo volta sozinho. E aqui vem o detalhe técnico forte:
 > o resolvedor DNS do Docker, o `127.0.0.11`, com o hostname numa variável, o
 > que força a reavaliação a cada 10 segundos."
 
-## Passo 8 — Idempotência (30 s)
+## Passo 8 — Siga o alerta até o fim (2-3 min)
+
+O passo anterior mostrou o alerta ficando vermelho na tela. Este mostra o
+alerta **chegando em alguém** — que é a parte que a maioria dos projetos de
+portfólio não tem.
+
+Com a aplicação ainda parada (ou pare de novo com `make incidente`):
+
+```bash
+make alertas          # o que o Alertmanager tem ativo agora
+make notificacoes     # o que efetivamente chegou ao notificador
+```
+
+Enquanto roda, a fala:
+
+> "O Prometheus só avalia a regra. Quem agrupa, inibe e entrega é o
+> Alertmanager. Repare no que **não** apareceu: quando a aplicação cai, quatro
+> alertas disparam juntos — serviço fora, caminho fim-a-fim falhando, taxa de
+> 5xx e latência. São quatro mensagens sobre o mesmo incidente. As regras de
+> inibição entregam só a causa e seguram os sintomas, porque um canal que toca
+> quatro vezes por incidente é silenciado pela equipe em duas semanas."
+
+Se o webhook do Discord estiver configurado, **mostre o celular**. É o momento
+mais forte da demonstração inteira.
+
+```bash
+make fim-incidente
+```
+
+> "E o alerta resolve sozinho em cerca de um minuto, com a notificação de
+> resolvido."
+
+### O detalhe que costuma impressionar
+
+```bash
+make slo
+```
+
+> "Além dos alertas de limiar, existem alertas por taxa de queima do orçamento
+> de erro. O SLO é 99,9% em 30 dias, o que dá 43 minutos ruins por mês. Se a
+> queima está em 14,4x, o orçamento do mês acaba em dois dias — isso acorda
+> alguém. Se está em 1x, vira tarefa, não plantão. Cada alerta exige uma
+> janela longa e uma curta ao mesmo tempo: a longa dá confiança de que é real,
+> a curta faz o alerta limpar sozinho quando passa."
+
+E, se sobrar fôlego, o que costuma render a melhor pergunta de volta:
+
+> "Tem um alerta aqui que dispara sempre, de propósito: `PipelineDeAlertasViva`,
+> cuja expressão é `vector(1)`. Ele não monitora o serviço, monitora o
+> monitoramento. Se o Prometheus cair, todos os outros alertas param de chegar
+> — e um canal silencioso é indistinguível de um canal saudável. O silêncio
+> desse alerta é o alarme."
+
+## Passo 9 — Métrica e log na mesma tela (1 min)
+
+Abra o dashboard de SLO em `localhost:3000/d/projeto-korp-slo`.
+
+> "Aqui embaixo estão os logs, vindos do Loki, na mesma tela dos gráficos. A
+> métrica diz *o que* quebrou; o log diz *por quê*. Ter os dois no mesmo lugar
+> é a diferença entre dois cliques e trocar de ferramenta no meio de um
+> incidente."
+
+Se perguntarem como o Promtail descobre os containers:
+
+> "Pela API do Docker, não por glob nos arquivos de log — pelo caminho em disco
+> o único identificador é o ID do container, que muda a cada recriação, e os
+> painéis quebrariam no primeiro `--force-recreate`. Mas ele não tem o socket
+> montado: montar o socket num container é dar root no host para ele, e o
+> Promtail é justamente quem parseia conteúdo não confiável. Ele fala com um
+> socket-proxy que só libera leitura de containers. O teste de aceitação
+> verifica que o socket não está lá."
+
+## Passo 10 — Idempotência (30 s)
 
 ```bash
 ansible-playbook -i inventory.ini site.yml
@@ -167,18 +248,18 @@ ansible-playbook -i inventory.ini site.yml
 > "Segunda execução: `changed=0`. A imagem só é reconstruída se o código
 > mudou, o NGINX só recarrega se o `.conf` mudou."
 
-## Passo 9 — Fechamento (30 s)
+## Passo 11 — Fechamento (30 s)
 
 ```bash
-make testar     # 30+ verificações, todas verdes
+make testar     # 55 verificações, todas verdes
 ```
 
 > "E esse script roda as mesmas verificações num pipeline de CI."
 
 Termine oferecendo o assunto que você domina:
 
-> "Posso abrir o Dockerfile, a configuração do NGINX ou o playbook, o que for
-> mais útil."
+> "Posso abrir o Dockerfile, a configuração do NGINX, as regras de SLO ou o
+> playbook, o que for mais útil."
 
 ---
 
