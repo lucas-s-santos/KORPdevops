@@ -1,6 +1,6 @@
 ---
 # ===========================================================================
-# Role: aplicacao — envia o código ao servidor e constrói a imagem Docker
+# Role: aplicação — envia o código ao servidor e constrói a imagem Docker
 # ===========================================================================
 
 # Carimbar o commit na imagem é o que permite, olhando o painel
@@ -15,7 +15,7 @@
 
 # A data do build vem do COMMIT, não do relógio da execução.
 #
-# Tirá-la do horário atual teria dois efeitos ruins: o .env mudaria a cada
+# Tirá-lá do horário atual teria dois efeitos ruins: o .env mudaria a cada
 # execução, a tarefa voltaria sempre "changed" e a idempotência que este
 # playbook promete deixaria de valer; e o mesmo commit produziria metadados
 # diferentes a cada build. Amarrada ao commit, a imagem fica reproduzível.
@@ -42,6 +42,10 @@
     - "{{ projeto_dir }}/grafana/provisioning/datasources"
     - "{{ projeto_dir }}/grafana/provisioning/dashboards"
     - "{{ projeto_dir }}/grafana/dashboards"
+    - "{{ projeto_dir }}/alertmanager"
+    - "{{ projeto_dir }}/notificador"
+    - "{{ projeto_dir }}/loki"
+    - "{{ projeto_dir }}/promtail"
 
 - name: Copiar o código-fonte da aplicação
   ansible.builtin.copy:
@@ -72,7 +76,13 @@
       APP_BUILD_DATE={{ data_build }}
       GRAFANA_USER={{ grafana_usuario }}
       GRAFANA_PASSWORD={{ grafana_senha }}
+      DISCORD_WEBHOOK_URL={{ discord_webhook_url }}
   register: env_gerado
+  # O .env passa a carregar um segredo: fora do log da execução e com 0640,
+  # legível apenas por root. `no_log` não é paranoia — sem ele a URL do
+  # webhook apareceria inteira na saída do Ansible e em qualquer CI que
+  # guardasse esse log.
+  no_log: "{{ discord_webhook_url | length > 0 }}"
 
 # `docker_image_build` executa `docker buildx build`, ou seja, com BuildKit.
 #

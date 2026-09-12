@@ -1,5 +1,11 @@
-# Regras de alerta. Ficam visíveis em Prometheus > Alerts; num ambiente real
-# seriam encaminhadas por um Alertmanager para Slack/PagerDuty.
+# Alertas por limiar — "o sintoma X passou do valor Y".
+#
+# São encaminhados ao Alertmanager (bloco `alerting:` do prometheus.yml), que
+# agrupa, inibe os sintomas redundantes e entrega ao notificador.
+#
+# Os alertas baseados em orçamento de erro ficam em slo-projeto-korp.yml.
+# Os dois tipos convivem de propósito: limiar responde rápido a uma quebra
+# evidente, taxa de queima pega a degradação lenta que nenhum limiar pega.
 groups:
   - name: disponibilidade-projeto-korp
     rules:

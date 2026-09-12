@@ -80,11 +80,50 @@ jobs:
             check config /p/prometheus.yml
           docker run --rm -v "$PWD/prometheus:/p" \
             --entrypoint promtool prom/prometheus:v2.55.1 \
-            check rules /p/rules/alertas-projeto-korp.yml
+            check rules /p/rules/alertas-projeto-korp.yml /p/rules/slo-projeto-korp.yml
+
+      - name: Alertmanager (amtool check-config)
+        run: |
+          docker run --rm -v "$PWD/alertmanager:/a" \
+            --entrypoint amtool prom/alertmanager:v0.27.0 \
+            check-config /a/alertmanager.yml
+
+      - name: Loki (verify-config)
+        run: |
+          docker run --rm -v "$PWD/loki:/loki-conf" grafana/loki:3.3.2 \
+            -config.file=/loki-conf/loki-config.yml -verify-config
+
+      # O Promtail não expõe um verificador de configuração próprio, então
+      # aqui a checagem é a que dá para fazer com honestidade: o arquivo é
+      # YAML válido e tem as chaves que o agente exige.
+      - name: Promtail (YAML válido e chaves obrigatórias)
+        run: |
+          python -c "
+          import yaml, sys
+          c = yaml.safe_load(open('promtail/promtail-config.yml'))
+          assert c['clients'][0]['url'].startswith('http://loki:'), 'cliente do Loki ausente'
+          assert c['scrape_configs'][0]['docker_sd_configs'], 'descoberta de containers ausente'
+          print('promtail-config.yml ok')
+          "
+
+      - name: Notificador (compila e responde ao formato do Alertmanager)
+        run: |
+          python -m py_compile notificador/notificador.py
+          echo "notificador.py compila"
 
       - name: Dashboard do Grafana é JSON válido
         run: |
-          python -c "import json; json.load(open('grafana/dashboards/http-server-projeto-korp-dashboard.json')); print('JSON válido')"
+          python -c "
+          import json, glob
+          for caminho in sorted(glob.glob('grafana/dashboards/*.json')):
+              d = json.load(open(caminho))
+              ids = [p['id'] for p in d['panels']]
+              assert len(ids) == len(set(ids)), caminho + ': ids de painel duplicados'
+              for p in d['panels']:
+                  g = p['gridPos']
+                  assert g['x'] + g['w'] <= 24, caminho + ': painel fora da grade de 24 colunas'
+              print('%s -> %d paineis, JSON valido' % (caminho, len(d['panels'])))
+          "
 
   # -------------------------------------------------------------------------
   e2e:
@@ -108,8 +147,20 @@ jobs:
             curl -sf http://localhost/projeto-korp > /dev/null
             curl -s  http://localhost/rota-inexistente > /dev/null
           done
-          # Dá tempo do Prometheus fazer pelo menos duas coletas.
-          sleep 35
+          # Tempo suficiente para a cadeia inteira fechar, não só para o
+          # Prometheus coletar: a regra do watchdog é avaliada (15s), o
+          # Alertmanager roteia, o notificador recebe, e só então o
+          # Prometheus coleta a métrica do notificador (mais 15s).
+          sleep 75
+
+      - name: Notificador aceita o payload do Alertmanager
+        run: |
+          docker run --rm --network korp-net curlimages/curl:8.10.1 \
+            -sf -X POST -H 'Content-Type: application/json' \
+            -d '{"version":"4","status":"firing","receiver":"korp-critico","alerts":[{"status":"firing","labels":{"alertname":"TesteDeCI","severidade":"critico","instance":"ci"},"annotations":{"resumo":"disparo sintetico do CI","descricao":"verifica o contrato do webhook"}}]}' \
+            http://notificador:9094/alertas
+          docker exec nginx wget -q -O- http://notificador:9094/metrics \
+            | grep 'alerta="TesteDeCI"'
 
       - name: Teste de aceitação
         run: bash scripts/teste-aceitacao.sh

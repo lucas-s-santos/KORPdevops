@@ -14,6 +14,23 @@ global:
 rule_files:
   - /etc/prometheus/rules/*.yml
 
+# ---------------------------------------------------------------------------
+# Para onde vão os alertas depois de disparados.
+#
+# O Prometheus só AVALIA as regras de rule_files; quem agrupa, inibe,
+# silencia e entrega é o Alertmanager. Sem este bloco, as regras acendem em
+# Prometheus > Alerts e ninguém fica sabendo — que era exatamente o estado
+# anterior deste projeto.
+# ---------------------------------------------------------------------------
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+      # Em produção seriam dois ou três Alertmanagers em cluster: eles
+      # deduplicam entre si, e um único processo é ponto único de falha
+      # justamente na hora em que o alerta importa.
+      timeout: 10s
+
 scrape_configs:
   # 1) O próprio Prometheus — se ele não estiver saudável, nenhuma outra
   #    métrica é confiável.
@@ -85,3 +102,40 @@ scrape_configs:
         target_label: instance
       - target_label: __address__
         replacement: blackbox-exporter:9115
+
+  # 6) Alertmanager. Monitorar o alertador é menos redundante do que parece:
+  #    `alertmanager_notifications_failed_total` é o que revela que os
+  #    alertas estão sendo gerados mas não entregues.
+  - job_name: alertmanager
+    static_configs:
+      - targets: ["alertmanager:9093"]
+        labels:
+          servico: alertmanager
+          camada: alertas
+
+  # 7) Notificador. Expõe `korp_alertas_recebidos_total`, que transforma
+  #    cada disparo em série temporal — é o que permite ao dashboard mostrar
+  #    o histórico de alertas junto dos gráficos que os causaram.
+  - job_name: notificador
+    static_configs:
+      - targets: ["notificador:9094"]
+        labels:
+          servico: notificador
+          camada: alertas
+
+  # 8) Loki. Se a ingestão de log parar, o painel de logs fica vazio e isso
+  #    se parece com "nada aconteceu" — o oposto da verdade.
+  - job_name: loki
+    static_configs:
+      - targets: ["loki:3100"]
+        labels:
+          servico: loki
+          camada: logs
+
+  # 9) Promtail — o agente que entrega os logs ao Loki.
+  - job_name: promtail
+    static_configs:
+      - targets: ["promtail:9080"]
+        labels:
+          servico: promtail
+          camada: logs

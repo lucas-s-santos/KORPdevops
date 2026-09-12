@@ -14,6 +14,7 @@ HOST="${HOST:-localhost}"
 PORTA_HTTP="${PORTA_HTTP:-80}"
 PORTA_PROM="${PORTA_PROM:-9090}"
 PORTA_GRAFANA="${PORTA_GRAFANA:-3000}"
+PORTA_AM="${PORTA_AM:-9093}"
 GRAFANA_USER="${GRAFANA_USER:-admin}"
 GRAFANA_PASSWORD="${GRAFANA_PASSWORD:-admin}"
 
@@ -133,7 +134,81 @@ REGRAS="$(curl -s --max-time 10 "http://${HOST}:${PORTA_PROM}/api/v1/rules" 2>/d
 verificar "regras de alerta carregadas" grep -q 'ServicoIndisponivel' <<<"$REGRAS"
 
 # --------------------------------------------------------------------------
-titulo "5. Grafana"
+titulo "5. Cadeia de alertas"
+
+verificar "Alertmanager responde" \
+  bash -c "curl -sf --max-time 10 http://${HOST}:${PORTA_AM}/-/healthy >/dev/null"
+
+# Esta é a checagem que pega o erro mais comum de quem monta alerta: regra
+# escrita, Alertmanager de pé, e os dois sem se falarem porque faltou o bloco
+# `alerting:` no prometheus.yml. Sem ela, tudo "parece" funcionar.
+AM="$(curl -s --max-time 10 "http://${HOST}:${PORTA_PROM}/api/v1/alertmanagers" 2>/dev/null)"
+verificar "Prometheus está apontando para o Alertmanager" \
+  grep -q 'alertmanager:9093' <<<"$AM"
+
+verificar "regras de taxa de queima carregadas" \
+  grep -q 'OrcamentoDeErroQueimandoRapido' <<<"$REGRAS"
+verificar "registros de SLO carregados" \
+  grep -q 'korp:queima_orcamento:rate1h' <<<"$REGRAS"
+
+# O watchdog dispara sempre, de propósito. Se ele chegou até o notificador, a
+# corrente inteira está provada — não apenas as duas pontas.
+watchdog_entregue() {
+  consultar 'korp_alertas_recebidos_total{alerta="PipelineDeAlertasViva"}' \
+    | grep -qE '"[1-9][0-9]*"\]'
+}
+verificar "watchdog percorreu Prometheus -> Alertmanager -> notificador" \
+  watchdog_entregue
+
+ALERTAS_AM="$(curl -s --max-time 10 "http://${HOST}:${PORTA_AM}/api/v2/alerts" 2>/dev/null)"
+verificar "Alertmanager registrou o alerta de watchdog" \
+  grep -q 'PipelineDeAlertasViva' <<<"$ALERTAS_AM"
+
+# As checagens internas passam pelo container do NGINX, que já está na
+# korp-net e cuja imagem (alpine) garante o wget do busybox. Depender do
+# cliente HTTP embutido em CADA imagem quebraria numa troca de base sem aviso.
+interno() { docker exec nginx wget -q -O- "$1" 2>/dev/null; }
+
+verificar "notificador responde no healthz" \
+  bash -c "docker exec nginx wget -q -O- http://notificador:9094/healthz | grep -q ok"
+verificar "notificador expõe korp_alertas_recebidos_total" \
+  bash -c "docker exec nginx wget -q -O- http://notificador:9094/metrics | grep -q korp_alertas_recebidos_total"
+
+# --------------------------------------------------------------------------
+titulo "6. Logs (Loki + Promtail)"
+
+loki_pronto() {
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if docker exec nginx wget -q -O- http://loki:3100/ready 2>/dev/null | grep -q ready; then
+      return 0
+    fi
+    sleep 3
+  done
+  return 1
+}
+verificar "Loki está pronto" loki_pronto
+
+# Loki e Promtail não têm healthcheck de container (a imagem não garante um
+# cliente HTTP embutido). A prontidão é provada aqui, por quem tem como
+# provar: o Prometheus coletando os dois com sucesso.
+for job in loki promtail; do
+  verificar "alvo '${job}' está sendo coletado (up == 1)" alvo_no_ar "$job"
+done
+
+promtail_entregou() {
+  consultar 'sum(promtail_sent_entries_total)' | grep -qE '"[1-9][0-9]*"\]'
+}
+verificar "Promtail já entregou linhas ao Loki" promtail_entregou
+
+# `values` só aparece no JSON quando há entradas de verdade; procurar por
+# `result` passaria também com uma resposta vazia.
+LOGS_APP="$(interno 'http://loki:3100/loki/api/v1/query_range?query=%7Bservico%3D%22http-server-projeto-korp%22%7D&limit=5')"
+verificar "Loki devolve logs da aplicação" grep -q '"values"' <<<"$LOGS_APP"
+verificar "os logs chegam rotulados pelo nome do serviço" \
+  grep -q 'http-server-projeto-korp' <<<"$LOGS_APP"
+
+# --------------------------------------------------------------------------
+titulo "7. Grafana"
 
 SAUDE="$(curl -s --max-time 10 "http://${HOST}:${PORTA_GRAFANA}/api/health" 2>/dev/null)"
 verificar "Grafana está saudável" grep -q '"database": *"ok"' <<<"$SAUDE"
@@ -146,10 +221,20 @@ DS="$(curl -s --max-time 10 -u "${GRAFANA_USER}:${GRAFANA_PASSWORD}" \
   "http://${HOST}:${PORTA_GRAFANA}/api/datasources/uid/prometheus" 2>/dev/null)"
 verificar "datasource Prometheus provisionado" grep -q '"type": *"prometheus"' <<<"$DS"
 
-# --------------------------------------------------------------------------
-titulo "6. Saúde dos containers"
+DASH_SLO="$(curl -s --max-time 10 -u "${GRAFANA_USER}:${GRAFANA_PASSWORD}" \
+  "http://${HOST}:${PORTA_GRAFANA}/api/dashboards/uid/projeto-korp-slo" 2>/dev/null)"
+verificar "dashboard 'projeto-korp-slo' provisionado" \
+  grep -q '"uid": *"projeto-korp-slo"' <<<"$DASH_SLO"
 
-for c in http-server-projeto-korp nginx prometheus grafana blackbox-exporter nginx-exporter; do
+DS_LOKI="$(curl -s --max-time 10 -u "${GRAFANA_USER}:${GRAFANA_PASSWORD}" \
+  "http://${HOST}:${PORTA_GRAFANA}/api/datasources/uid/loki" 2>/dev/null)"
+verificar "datasource Loki provisionado" grep -q '"type": *"loki"' <<<"$DS_LOKI"
+
+# --------------------------------------------------------------------------
+titulo "8. Saúde dos containers"
+
+CONTAINERS="http-server-projeto-korp nginx nginx-exporter blackbox-exporter prometheus grafana alertmanager notificador loki promtail docker-socket-proxy"
+for c in $CONTAINERS; do
   verificar "container ${c} em execução" \
     bash -c "docker inspect -f '{{.State.Running}}' ${c} 2>/dev/null | grep -qx true"
 done
@@ -158,6 +243,15 @@ verificar "healthcheck da aplicação está 'healthy'" \
   bash -c "docker inspect -f '{{.State.Health.Status}}' http-server-projeto-korp 2>/dev/null | grep -qx healthy"
 verificar "aplicação roda como usuário não-root" \
   bash -c "docker inspect -f '{{.Config.User}}' http-server-projeto-korp | grep -qx '65532:65532'"
+
+verificar "notificador roda como usuário não-root" \
+  bash -c "docker inspect -f '{{.Config.User}}' notificador | grep -qx '65534:65534'"
+
+# O Promtail precisa da API do Docker, mas NÃO deve ter o socket montado:
+# quem fala direto com o socket tem, na prática, root no host. Ele conversa
+# com o docker-socket-proxy, que só libera leitura de containers.
+verificar "Promtail NÃO tem o socket do Docker montado" \
+  bash -c "! docker inspect -f '{{range .Mounts}}{{.Source}} {{end}}' promtail | grep -q docker.sock"
 
 # --------------------------------------------------------------------------
 printf '\n%s\n' "============================================================"

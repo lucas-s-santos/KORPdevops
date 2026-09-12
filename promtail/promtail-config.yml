@@ -1,0 +1,101 @@
+# ---------------------------------------------------------------------------
+# Promtail — coleta os logs dos containers e entrega ao Loki.
+#
+# A descoberta é feita pela API do Docker, e não por glob em
+# /var/lib/docker/containers/*/*-json.log, por um motivo prático: pelo
+# caminho em disco o único identificador disponível é o ID do container — um
+# hash que muda a cada recriação. Pela API vem o NOME e as labels do Compose,
+# então o painel do Grafana pode filtrar por `servico="nginx"` e continuar
+# funcionando depois de um `docker compose up --force-recreate`.
+#
+# O acesso à API não é direto: passa pelo docker-socket-proxy, que só libera
+# leitura de containers. Ver o comentário do serviço no docker-compose.yml.
+# ---------------------------------------------------------------------------
+
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+  log_level: warn
+
+positions:
+  # Até onde cada log já foi lido. No volume nomeado para que um restart do
+  # Promtail não reenvie tudo desde o início (logs duplicados no Loki).
+  filename: /promtail/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+    # Se o Loki estiver reiniciando, tenta por até ~5 minutos antes de
+    # descartar, em vez de perder a janela inteira do incidente.
+    backoff_config:
+      min_period: 500ms
+      max_period: 1m
+      max_retries: 20
+
+scrape_configs:
+  - job_name: containers-projeto-korp
+
+    docker_sd_configs:
+      - host: tcp://docker-socket-proxy:2375
+        refresh_interval: 15s
+        filters:
+          # Só os containers desta stack. Sem o filtro, o Promtail coletaria
+          # qualquer container do host — inclusive de outros projetos.
+          - name: label
+            values: ["com.docker.compose.project=projeto-korp"]
+
+    relabel_configs:
+      # O nome vem da API com uma barra na frente (`/nginx`).
+      - source_labels: ["__meta_docker_container_name"]
+        regex: "/(.*)"
+        target_label: container
+
+      - source_labels: ["__meta_docker_container_label_com_docker_compose_service"]
+        target_label: servico
+
+      # Mesma label que o Prometheus carimba em external_labels: permite
+      # cruzar métrica e log pelo mesmo identificador de ambiente.
+      - target_label: ambiente
+        replacement: desafio-korp
+
+      - target_label: origem
+        replacement: promtail
+
+    pipeline_stages:
+      # A aplicação Go (slog) e o notificador (json.dumps) escrevem JSON. O
+      # NGINX, o Prometheus e o Grafana não — por isso o `match`: aplicar o
+      # parser de JSON em texto solto encheria o log do Promtail de erros.
+      - match:
+          selector: '{servico=~"http-server-projeto-korp|notificador"}'
+          stages:
+            - json:
+                expressions:
+                  level: level
+                  msg: msg
+                  alerta: alerta
+                  severidade: severidade
+
+            # Vira label: `level` tem meia dúzia de valores possíveis, então
+            # é seguro indexar. Nunca promover a label algo de alta
+            # cardinalidade (ID de requisição, IP, path com parâmetro) — no
+            # Loki cada combinação de labels cria um fluxo separado, e é
+            # assim que se derruba um Loki.
+            - labels:
+                level:
+
+            # Usa o horário do próprio registro em vez da hora em que o
+            # Promtail leu a linha. Sem isto, um atraso na coleta desloca o
+            # log em relação à métrica e a correlação no Grafana mente.
+            - timestamp:
+                source: time
+                format: RFC3339Nano
+                action_on_failure: fudge
+
+      # O NGINX escreve o access log em texto. Extrair o status permite
+      # filtrar "só os 5xx" no Grafana sem varrer a linha inteira.
+      - match:
+          selector: '{servico="nginx"}'
+          stages:
+            - regex:
+                expression: '\s(?P<status>\d{3})\s\d+\s"'
+            - labels:
+                status:

@@ -17,3 +17,7 @@ ansible/collections/
 .DS_Store
 .idea/
 .vscode/
+
+# Python (notificador)
+__pycache__/
+*.pyc

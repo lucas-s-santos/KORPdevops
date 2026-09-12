@@ -42,6 +42,11 @@
     - grafana
     - blackbox-exporter
     - nginx-exporter
+    - alertmanager
+    - notificador
+    - loki
+    - promtail
+    - docker-socket-proxy
   loop_control:
     label: "{{ item }}"
 

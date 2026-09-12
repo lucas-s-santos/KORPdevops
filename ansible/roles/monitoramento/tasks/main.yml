@@ -24,16 +24,51 @@
     dest: "{{ projeto_dir }}/blackbox/blackbox.yml"
     mode: "0644"
 
-- name: Copiar o provisionamento do Grafana (datasource e provider)
+- name: Copiar o provisionamento do Grafana (datasources e provider)
   ansible.builtin.copy:
     src: "{{ raiz_repositorio }}/grafana/provisioning/"
     dest: "{{ projeto_dir }}/grafana/provisioning/"
     mode: "0644"
+  register: conf_grafana
 
-- name: Copiar o JSON do dashboard
+- name: Copiar os JSON dos dashboards
   ansible.builtin.copy:
-    src: "{{ raiz_repositorio }}/grafana/dashboards/http-server-projeto-korp-dashboard.json"
-    dest: "{{ projeto_dir }}/grafana/dashboards/http-server-projeto-korp-dashboard.json"
+    src: "{{ raiz_repositorio }}/grafana/dashboards/"
+    dest: "{{ projeto_dir }}/grafana/dashboards/"
+    mode: "0644"
+
+# ---------------------------------------------------------------------------
+# Cadeia de alertas: Alertmanager -> notificador
+# ---------------------------------------------------------------------------
+- name: Copiar a configuração do Alertmanager
+  ansible.builtin.copy:
+    src: "{{ raiz_repositorio }}/alertmanager/alertmanager.yml"
+    dest: "{{ projeto_dir }}/alertmanager/alertmanager.yml"
+    mode: "0644"
+  register: conf_alertmanager
+
+- name: Copiar o notificador de alertas
+  ansible.builtin.copy:
+    src: "{{ raiz_repositorio }}/notificador/notificador.py"
+    dest: "{{ projeto_dir }}/notificador/notificador.py"
+    # 0644 e não 0755: o container chama `python /app/notificador.py`, então
+    # o arquivo precisa ser legivel, não executavel.
+    mode: "0644"
+  register: conf_notificador
+
+# ---------------------------------------------------------------------------
+# Logs: Loki -> Promtail
+# ---------------------------------------------------------------------------
+- name: Copiar a configuração do Loki
+  ansible.builtin.copy:
+    src: "{{ raiz_repositorio }}/loki/loki-config.yml"
+    dest: "{{ projeto_dir }}/loki/loki-config.yml"
+    mode: "0644"
+
+- name: Copiar a configuração do Promtail
+  ansible.builtin.copy:
+    src: "{{ raiz_repositorio }}/promtail/promtail-config.yml"
+    dest: "{{ projeto_dir }}/promtail/promtail-config.yml"
     mode: "0644"
 
 - name: Conferir se o Prometheus já está em execução
@@ -59,10 +94,80 @@
   until: reload_prometheus is succeeded
   failed_when: false
 
+- name: Conferir se o Alertmanager já está em execução
+  community.docker.docker_container_info:
+    name: alertmanager
+  register: info_alertmanager
+  failed_when: false
+
+# O Alertmanager aceita POST /-/reload sem precisar de flag, diferente do
+# Prometheus. Recarregar em vez de reiniciar preserva os silêncios ativos —
+# reiniciar no meio de um incidente reabriria o canal que alguém acabou de
+# calar de propósito.
+- name: Recarregar a configuração do Alertmanager
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ porta_alertmanager }}/-/reload"
+    method: POST
+    status_code: [200]
+  when:
+    - info_alertmanager.exists | default(false)
+    - conf_alertmanager is changed
+  retries: 3
+  delay: 2
+  register: reload_alertmanager
+  until: reload_alertmanager is succeeded
+  failed_when: false
+
+- name: Conferir se o notificador já está em execução
+  community.docker.docker_container_info:
+    name: notificador
+  register: info_notificador
+  failed_when: false
+
+# O script do notificador entra por volume e é lido uma única vez, na
+# inicialização. Como o conteúdo de um arquivo montado não muda a definição
+# do container, o `recreate: auto` da role `stack` não percebe a alteração —
+# por isso o restart explicito aqui.
+- name: Reiniciar o notificador quando o script mudar
+  community.docker.docker_container:
+    name: notificador
+    state: started
+    restart: true
+  when:
+    - info_notificador.exists | default(false)
+    - conf_notificador is changed
+
+- name: Conferir se o Grafana já está em execução
+  community.docker.docker_container_info:
+    name: grafana
+  register: info_grafana
+  failed_when: false
+
+# O Grafana lê o provisionamento de DATASOURCE uma única vez, na
+# inicialização. Os dashboards são diferentes: o provider relê o diretório a
+# cada 30s (updateIntervalSeconds em dashboards.yml), então JSON novo aparece
+# sozinho. Datasource, não — acrescentar um ao arquivo não tem efeito algum
+# enquanto o container não reiniciar, e o sintoma é traiçoeiro: o arquivo
+# está certo no disco, o playbook diz "ok", e o painel continua vazio.
+- name: Reiniciar o Grafana quando o provisionamento mudar
+  community.docker.docker_container:
+    name: grafana
+    state: started
+    restart: true
+  when:
+    - info_grafana.exists | default(false)
+    - conf_grafana is changed
+
 - name: Confirmar os arquivos de monitoramento
   ansible.builtin.debug:
     msg:
       - "Prometheus : {{ projeto_dir }}/prometheus/prometheus.yml"
       - "Alertas    : {{ projeto_dir }}/prometheus/rules/"
+      - "SLO        : {{ projeto_dir }}/prometheus/rules/slo-projeto-korp.yml"
       - "Blackbox   : {{ projeto_dir }}/blackbox/blackbox.yml"
-      - "Grafana    : datasource e dashboard provisionados por arquivo"
+      - "Alertmanag.: {{ projeto_dir }}/alertmanager/alertmanager.yml"
+      - "Notificador: {{ projeto_dir }}/notificador/notificador.py"
+      - "Loki       : {{ projeto_dir }}/loki/loki-config.yml"
+      - "Promtail   : {{ projeto_dir }}/promtail/promtail-config.yml"
+      - "Grafana    : datasources e dashboards provisionados por arquivo"
+      - "Discord    : {{ 'webhook configurado' if discord_webhook_url | length > 0 else 'sem webhook (alerta vai para log e metrica)' }}"

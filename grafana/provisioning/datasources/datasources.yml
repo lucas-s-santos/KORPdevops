@@ -1,6 +1,6 @@
-# Provisionamento do datasource. Com este arquivo o Grafana já sobe apontando
-# para o Prometheus — nada é configurado pela interface, então o ambiente é
-# reprodutível e versionado em Git.
+# Provisionamento dos datasources. Com este arquivo o Grafana já sobe
+# apontando para o Prometheus e para o Loki — nada é configurado pela
+# interface, então o ambiente é reprodutível e versionado em Git.
 apiVersion: 1
 
 datasources:
@@ -17,3 +17,29 @@ datasources:
       # escolha passos de consulta coerentes nos gráficos.
       timeInterval: 15s
       httpMethod: POST
+      # Liga o botão "Logs" nos painéis de série temporal: o Grafana leva o
+      # intervalo de tempo selecionado no gráfico direto para o Loki. É o
+      # caminho de dois cliques entre "o gráfico subiu" e "por quê".
+      exemplarTraceIdDestinations: []
+
+  - name: Loki
+    type: loki
+    access: proxy
+    uid: loki
+    url: http://loki:3100
+    editable: false
+    jsonData:
+      # Teto de linhas por consulta. Alto demais trava o navegador quando
+      # alguém esquece o filtro e pede a stack inteira.
+      maxLines: 1000
+      timeout: 60
+      derivedFields:
+        # Transforma o campo `alerta` dos logs do notificador num link que
+        # abre o alerta correspondente no Prometheus. Log estruturado deixa
+        # de ser texto e vira navegação.
+        - name: alerta
+          matcherType: label
+          matcherRegex: "alerta"
+          datasourceUid: prometheus
+          url: 'ALERTS{alertname="${__value.raw}"}'
+          urlDisplayLabel: "Ver alerta no Prometheus"

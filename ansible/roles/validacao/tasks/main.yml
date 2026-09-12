@@ -191,7 +191,119 @@
   failed_when: false
 
 # ---------------------------------------------------------------------------
-# 4) Resumo final
+# 4) Cadeia de alertas
+#
+# Esta é a parte que a maioria dos ambientes não valida: dá para ter regra de
+# alerta escrita, Alertmanager de pé e MESMO ASSIM nenhuma notificação chegar
+# — basta o bloco `alerting:` faltar no prometheus.yml, ou um matcher não
+# casar com nenhuma rota. As tarefas abaixo seguem o alerta do começo ao fim.
+# ---------------------------------------------------------------------------
+- name: Verificar a saúde do Alertmanager
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ porta_alertmanager }}/-/healthy"
+    method: GET
+    status_code: 200
+  register: saude_alertmanager
+  retries: 20
+  delay: 3
+  until: saude_alertmanager.status | default(0) == 200
+
+- name: Confirmar que o Prometheus enxerga o Alertmanager
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ porta_prometheus }}/api/v1/alertmanagers"
+    method: GET
+    return_content: true
+    status_code: 200
+  register: alertmanagers_ativos
+  retries: 20
+  delay: 3
+  until:
+    - alertmanagers_ativos.json is defined
+    - (alertmanagers_ativos.json.data.activeAlertmanagers | default([])) | length > 0
+
+# O watchdog (`PipelineDeAlertasViva`) dispara sempre e é roteado com
+# group_wait de 0s. Se ele chegou ao notificador, então Prometheus avaliou,
+# Alertmanager roteou e o webhook foi entregue — a corrente inteira está
+# funcionando, não apenas as pontas.
+- name: Aguardar o alerta de watchdog percorrer a cadeia até o notificador
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ porta_prometheus }}/api/v1/query"
+    method: POST
+    return_content: true
+    body_format: form-urlencoded
+    body:
+      query: 'korp_alertas_recebidos_total{alerta="PipelineDeAlertasViva"}'
+  register: consulta_watchdog
+  retries: 30
+  delay: 5
+  until:
+    - consulta_watchdog.json is defined
+    - (consulta_watchdog.json.data.result | default([])) | length > 0
+    - (consulta_watchdog.json.data.result[0].value[1] | default(0) | float) > 0
+
+- name: CADEIA DE ALERTAS VALIDADA
+  ansible.builtin.debug:
+    msg: |-
+
+      ===========================================================
+       O ALERTA PERCORREU A CADEIA INTEIRA
+      ===========================================================
+       Prometheus avaliou a regra     -> PipelineDeAlertasViva
+       Alertmanager roteou            -> receiver korp-watchdog
+       Notificador recebeu o webhook  -> {{ consulta_watchdog.json.data.result[0].value[1] }} entrega(s)
+
+       Isso prova a corrente completa, não apenas as pontas:
+       regra -> avaliação -> roteamento -> entrega.
+      ===========================================================
+
+# ---------------------------------------------------------------------------
+# 5) Logs
+# ---------------------------------------------------------------------------
+- name: Confirmar que o Promtail está entregando logs ao Loki
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ porta_prometheus }}/api/v1/query"
+    method: POST
+    return_content: true
+    body_format: form-urlencoded
+    body:
+      query: "sum(promtail_sent_entries_total)"
+  register: consulta_logs
+  retries: 30
+  delay: 5
+  until:
+    - consulta_logs.json is defined
+    - (consulta_logs.json.data.result | default([])) | length > 0
+    - (consulta_logs.json.data.result[0].value[1] | default(0) | float) > 0
+
+- name: Confirmar que o datasource do Loki foi provisionado
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ porta_grafana }}/api/datasources/uid/loki"
+    method: GET
+    user: "{{ grafana_usuario }}"
+    password: "{{ grafana_senha }}"
+    force_basic_auth: true
+    status_code: 200
+  register: datasource_loki
+  retries: 20
+  delay: 3
+  until: datasource_loki.status | default(0) == 200
+
+- name: Confirmar que o dashboard de SLO foi provisionado
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ porta_grafana }}/api/dashboards/uid/projeto-korp-slo"
+    method: GET
+    user: "{{ grafana_usuario }}"
+    password: "{{ grafana_senha }}"
+    force_basic_auth: true
+    status_code: 200
+  register: dashboard_slo
+  retries: 20
+  delay: 3
+  until: dashboard_slo.status | default(0) == 200
+  failed_when: false
+
+# ---------------------------------------------------------------------------
+# 6) Resumo final
 # ---------------------------------------------------------------------------
 - name: RESUMO DO AMBIENTE
   ansible.builtin.debug:
@@ -209,7 +321,17 @@
                     http://localhost:{{ porta_grafana }}/d/projeto-korp
                     login: {{ grafana_usuario }} / {{ grafana_senha }}
 
-       Datasource   {{ 'provisionado' if datasource_grafana.status | default(0) == 200 else 'verificar' }}
+       Alertmanager http://localhost:{{ porta_alertmanager }}          [{{ 'OK' if saude_alertmanager.status | default(0) == 200 else 'FALHA' }}]
+                    cadeia validada ponta a ponta pelo watchdog
+
+       SLO          {{ slo_disponibilidade }}
+       Dashboard    http://localhost:{{ porta_grafana }}/d/projeto-korp-slo
+                    {{ 'provisionado' if dashboard_slo.status | default(0) == 200 else 'verificar' }}
+
+       Logs         Loki + Promtail, {{ consulta_logs.json.data.result[0].value[1] | default('0') | float | round | int }} linhas entregues
+       Datasources  Prometheus {{ 'OK' if datasource_grafana.status | default(0) == 200 else 'verificar' }} | Loki {{ 'OK' if datasource_loki.status | default(0) == 200 else 'verificar' }}
+
+       Notificação  {{ 'Discord configurado' if discord_webhook_url | length > 0 else 'somente log e métrica (sem webhook do Discord)' }}
        Rede Docker  {{ rede_nome }} ({{ rede_driver }}, {{ rede_subnet }})
        Diretório    {{ projeto_dir }}
       ===========================================================

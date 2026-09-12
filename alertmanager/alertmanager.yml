@@ -1,0 +1,107 @@
+# ---------------------------------------------------------------------------
+# Alertmanager — o que fazer depois que uma regra do Prometheus dispara.
+#
+# O Prometheus apenas AVALIA as regras. Quem agrupa, silencia, inibe e
+# entrega a notificação é o Alertmanager. Sem ele, os alertas em
+# prometheus/rules/ ficam visíveis na interface do Prometheus e nada mais
+# acontece — ninguém é avisado.
+# ---------------------------------------------------------------------------
+
+global:
+  # Se o Prometheus parar de reenviar um alerta por este tempo, o
+  # Alertmanager o considera resolvido por conta própria. Precisa ser
+  # confortavelmente maior que o intervalo de reenvio do Prometheus (1m por
+  # padrão), senão alertas ativos piscam entre "resolvido" e "disparando".
+  resolve_timeout: 5m
+
+# ---------------------------------------------------------------------------
+# Árvore de roteamento. Um alerta entra na raiz e desce até a primeira rota
+# filha cujos matchers casem; o que não casa com nenhuma fica na raiz.
+# ---------------------------------------------------------------------------
+route:
+  receiver: korp-padrao
+
+  # Agrupamento: alertas com os mesmos valores nestas labels viram UMA
+  # notificação. Sem isso, um incidente que derruba varios alvos manda uma
+  # mensagem por alvo e enterra o canal no pior momento possível.
+  group_by: [alertname, severidade]
+
+  # Espera antes da primeira notificação de um grupo novo. Dá tempo de outros
+  # alertas do mesmo incidente chegarem e entrarem na mesma mensagem.
+  group_wait: 30s
+
+  # Espera antes de notificar de novo um grupo que já notificou, quando
+  # alertas NOVOS entram nele.
+  group_interval: 5m
+
+  # Reenvio de um grupo que não mudou nada. É o intervalo do "isso ainda está
+  # quebrado". Curto demais vira spam e treina todo mundo a ignorar o canal.
+  repeat_interval: 4h
+
+  routes:
+    # 1) Dead man's switch: alerta que dispara SEMPRE, de propósito. Se ele
+    #    parar de chegar, o problema não é o serviço — é a própria cadeia de
+    #    alertas (Prometheus caiu, Alertmanager caiu, a rede quebrou). E o
+    #    único jeito de detectar que o monitoramento morreu em silêncio.
+    - matchers: ['severidade="watchdog"']
+      receiver: korp-watchdog
+      group_wait: 0s
+      group_interval: 5m
+      repeat_interval: 5m
+
+    # 2) Crítico: acorda gente. Espera curta e reenvio de hora em hora.
+    - matchers: ['severidade="critico"']
+      receiver: korp-critico
+      group_wait: 10s
+      repeat_interval: 1h
+
+    # 3) Alto e aviso: entra no canal, mas não insiste.
+    - matchers: ['severidade=~"alto|aviso"']
+      receiver: korp-padrao
+      repeat_interval: 12h
+
+# ---------------------------------------------------------------------------
+# Inibição: suprime o SINTOMA quando a CAUSA já foi notificada.
+#
+# Quando a aplicação cai, ela para de responder (ServicoIndisponivel), o
+# probe fim-a-fim falha, a taxa de erro explode e o p95 estoura. São quatro
+# mensagens sobre um único incidente. As regras abaixo mandam só a primeira.
+# ---------------------------------------------------------------------------
+inhibit_rules:
+  - source_matchers: ['alertname="ServicoIndisponivel"']
+    target_matchers:
+      - 'alertname=~"CaminhoFimAFimFalhando|TaxaDeErro5xxAlta|LatenciaP95Alta|CertificadoDeSaudeAusente|OrcamentoDeErroQueimandoRapido|OrcamentoDeErroQueimandoDevagar"'
+
+  # Caminho quebrado devolve 502 em milissegundos ou estoura timeout: o
+  # número de latência nessa hora não diz nada útil.
+  - source_matchers: ['alertname="CaminhoFimAFimFalhando"']
+    target_matchers: ['alertname="LatenciaP95Alta"']
+
+# ---------------------------------------------------------------------------
+# Receivers. Todos apontam para o mesmo notificador; o que muda entre eles é
+# o ritmo definido nas rotas acima e o `send_resolved`.
+#
+# O notificador é um serviço próprio (notificador/notificador.py) em vez de
+# `discord_configs` nativo por dois motivos: o Alertmanager não expande
+# variáveis de ambiente neste arquivo — a URL do webhook teria que ser
+# commitada em texto puro — e passar por um serviço próprio transforma cada
+# alerta em log estruturado e métrica, deixando histórico.
+# ---------------------------------------------------------------------------
+receivers:
+  - name: korp-padrao
+    webhook_configs:
+      - url: http://notificador:9094/alertas
+        send_resolved: true
+        max_alerts: 20
+
+  - name: korp-critico
+    webhook_configs:
+      - url: http://notificador:9094/alertas
+        send_resolved: true
+
+  - name: korp-watchdog
+    webhook_configs:
+      - url: http://notificador:9094/alertas
+        # O watchdog não "resolve": ele dispara para sempre. Avisar que
+        # resolveu só poluiria.
+        send_resolved: false

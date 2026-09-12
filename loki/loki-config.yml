@@ -1,0 +1,79 @@
+# ---------------------------------------------------------------------------
+# Loki — armazenamento dos logs.
+#
+# Métrica responde "o serviço está errando?". Log responde "por que?". Ter os
+# dois no MESMO Grafana é o que permite ir de um pico no gráfico para a linha
+# de log daquele instante sem trocar de ferramenta.
+#
+# Configuração de nó único (monolithic): ingester, distributor, querier e
+# compactor no mesmo processo, com os chunks em disco. E o modo adequado
+# para um ambiente deste tamanho — o modo distribuido só faz sentido com
+# vários nós e um object store de verdade (S3, GCS).
+# ---------------------------------------------------------------------------
+
+# Sem multi-tenancy: um ambiente, um tenant. Com `auth_enabled: true` toda
+# requisicao precisaria do cabecalho X-Scope-OrgID.
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9096
+  # O Loki é falante demais em `info`; em `warn` o log dele não afoga o log
+  # da aplicação, que é o que interessa aqui.
+  log_level: warn
+
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      # Anel em memória: não há outro nó com quem combinar.
+      store: inmemory
+
+schema_config:
+  configs:
+    # TSDB + schema v13 é o padrão atual do Loki 3.x. Schemas antigos
+    # (boltdb-shipper, v11/v12) ainda funcionam, mas consultam mais devagar e
+    # não recebem mais otimizacao.
+    - from: "2024-01-01"
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+limits_config:
+  # 7 dias de log. Métrica é barata e fica 30 dias; log é caro e responde
+  # perguntas sobre o passado recente — guardar mês de log neste ambiente só
+  # encheria disco.
+  retention_period: 168h
+  reject_old_samples: true
+  reject_old_samples_max_age: 168h
+  ingestion_rate_mb: 8
+  ingestion_burst_size_mb: 16
+  max_query_series: 5000
+  # Habilita a API de volume, usada pelo painel de "logs por servico".
+  volume_enabled: true
+
+compactor:
+  working_directory: /loki/compactor
+  # Sem isto a `retention_period` acima é apenas decorativa: o compactor é
+  # quem de fato apaga os chunks vencidos.
+  retention_enabled: true
+  delete_request_store: filesystem
+
+ruler:
+  storage:
+    type: local
+    local:
+      directory: /loki/rules
+
+# Telemetria de uso desligada: ambiente fechado não fala com a internet.
+analytics:
+  reporting_enabled: false

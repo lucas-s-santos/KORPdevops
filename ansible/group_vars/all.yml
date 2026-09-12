@@ -44,3 +44,25 @@ grafana_senha: admin
 url_validacao: "http://127.0.0.1:{{ porta_http }}/projeto-korp"
 tentativas_validacao: 30
 espera_entre_tentativas: 2
+
+# --- Alertas e observabilidade -------------------------------------------
+porta_alertmanager: 9093
+porta_notificador: 9094
+porta_loki: 3100
+
+# URL do webhook do Discord que recebe as notificações.
+#
+# Vazio é um estado válido e é o padrão: sem ele o alerta continua virando
+# log estruturado e métrica, e nada quebra — é assim que o CI roda, sem
+# precisar de credencial nenhuma.
+#
+# Para preencher sem commitar o segredo:
+#   ansible-playbook -i inventory.ini site.yml \
+#     -e discord_webhook_url='https://discord.com/api/webhooks/...'
+#
+# Em produção viria de um Ansible Vault ou de um cofre externo.
+discord_webhook_url: ""
+
+# Apenas para exibição no resumo final; os valores que valem estão em
+# prometheus/rules/slo-projeto-korp.yml.
+slo_disponibilidade: "99,9% das requisições sem 5xx, em 30 dias"

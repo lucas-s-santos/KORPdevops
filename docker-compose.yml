@@ -4,6 +4,15 @@
 #   host:80   -> nginx -> http-server-projeto-korp:8080   (somente rede interna)
 #   host:9090 -> prometheus
 #   host:3000 -> grafana
+#   host:9093 -> alertmanager
+#
+# Caminho de um alerta, da métrica até o celular:
+#
+#   aplicação  -> /metrics
+#   prometheus -> avalia prometheus/rules/*.yml
+#   alertmanager -> agrupa, inibe o que é sintoma, roteia por severidade
+#   notificador  -> vira log estruturado + métrica, e posta no Discord
+#   promtail -> lê esse log -> loki -> aparece no mesmo Grafana do gráfico
 #
 # A chave `version:` foi omitida de propósito: está obsoleta no Compose V2 e
 # só gera aviso na subida.
@@ -184,7 +193,10 @@ services:
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.path=/prometheus
-      - --storage.tsdb.retention.time=15d
+      # 31 dias: um a mais que a janela de 30 do SLO. Com 15d, a regra
+      # korp:erro_requisicoes:ratio_rate30d calcularia a media de meia
+      # janela e reportaria um SLO otimista.
+      - --storage.tsdb.retention.time=31d
       # Permite recarregar a configuração com POST /-/reload, sem reiniciar.
       - --web.enable-lifecycle
       - --web.console.libraries=/usr/share/prometheus/console_libraries
@@ -263,7 +275,249 @@ services:
       - no-new-privileges:true
 
   # -------------------------------------------------------------------------
-  # 7) Gerador de carga (opcional) — só sobe com o perfil `carga`:
+  # 7) Alertmanager — agrupa, inibe e entrega os alertas que o Prometheus
+  #    dispara. Sem ele, as regras de prometheus/rules/ só acendem uma linha
+  #    vermelha numa tela que ninguém está olhando às 3h da manhã.
+  # -------------------------------------------------------------------------
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    container_name: alertmanager
+    hostname: alertmanager
+    restart: *restart-padrao
+    logging: *logging-padrao
+
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+      # A URL externa vai nos links das notificações. Sem ela o Alertmanager
+      # monta os links com o hostname do container, que ninguém consegue
+      # abrir do navegador do host.
+      - --web.external-url=http://localhost:9093
+      - --log.level=warn
+
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      # Volume nomeado: os silêncios criados durante um incidente sobrevivem
+      # a um restart. Silêncio perdido no meio da madrugada = canal inundado
+      # de novo, justamente quando alguém está tentando consertar.
+      - alertmanager-data:/alertmanager
+
+    ports:
+      - "9093:9093"
+
+    networks:
+      - korp-net
+
+    depends_on:
+      notificador:
+        condition: service_healthy
+
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:9093/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+    security_opt:
+      - no-new-privileges:true
+
+  # -------------------------------------------------------------------------
+  # 8) Notificador — recebe o webhook do Alertmanager, registra o alerta em
+  #    log estruturado, conta numa métrica e repassa ao Discord.
+  #
+  #    Roda a biblioteca padrão do Python sobre a imagem oficial: sem build,
+  #    sem `pip install`, sem lockfile. O script é montado como volume, então
+  #    o "deploy" dele é reiniciar o container.
+  # -------------------------------------------------------------------------
+  notificador:
+    image: python:3.12-alpine
+    container_name: notificador
+    hostname: notificador
+    restart: *restart-padrao
+    logging: *logging-padrao
+
+    # `-u` desliga o buffer de stdout: sem isso o log só apareceria quando o
+    # buffer enchesse, e um alerta que chega com 4KB de atraso não serve.
+    command: ["python", "-u", "/app/notificador.py"]
+
+    environment:
+      PORTA: "9094"
+      # O único segredo da stack. Vazio = o alerta fica no log e na métrica e
+      # nada quebra; é assim que o CI roda, sem precisar de credencial.
+      DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL:-}
+      # Sem isto o Python tenta gravar .pyc e esbarra no read_only abaixo.
+      PYTHONDONTWRITEBYTECODE: "1"
+      TZ: "UTC"
+
+    volumes:
+      - ./notificador/notificador.py:/app/notificador.py:ro
+
+    expose:
+      - "9094"
+
+    networks:
+      - korp-net
+
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:9094/healthz || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+    # Mesmo endurecimento da aplicação Go: usuário sem privilégio, sem
+    # capabilities, sistema de arquivos somente leitura.
+    user: "65534:65534"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 96M
+
+  # -------------------------------------------------------------------------
+  # 9) Loki — armazena os logs. Métrica diz QUE quebrou; log diz POR QUÊ.
+  #    Estando os dois no mesmo Grafana, o caminho entre as duas perguntas é
+  #    de dois cliques, sem trocar de ferramenta no meio do incidente.
+  # -------------------------------------------------------------------------
+  loki:
+    image: grafana/loki:3.3.2
+    container_name: loki
+    hostname: loki
+    restart: *restart-padrao
+    logging: *logging-padrao
+
+    command: ["-config.file=/etc/loki/loki-config.yml"]
+
+    volumes:
+      - ./loki/loki-config.yml:/etc/loki/loki-config.yml:ro
+      - loki-data:/loki
+
+    expose:
+      - "3100"
+
+    networks:
+      - korp-net
+
+    # Sem healthcheck de propósito: a imagem do Loki não garante um cliente
+    # HTTP embutido (wget/curl), e healthcheck que depende de binário
+    # incerto dentro da imagem quebra numa atualização de versão sem avisar.
+    #
+    # A prontidão é verificada de fora, por quem tem como verificar: o
+    # Prometheus coleta o job `loki`, e tanto a role `validacao` quanto o
+    # teste de aceitação exigem `up{job="loki"} == 1` e linhas efetivamente
+    # entregues. Isso prova mais do que um healthcheck provaria — não só que
+    # o processo respondeu, mas que o log está chegando.
+    security_opt:
+      - no-new-privileges:true
+
+  # -------------------------------------------------------------------------
+  # 10) Proxy do socket do Docker.
+  #
+  #     O Promtail precisa da API do Docker para descobrir os containers pelo
+  #     NOME (pelo caminho em disco só existiria o ID, um hash que muda a
+  #     cada recriação). Só que montar /var/run/docker.sock direto num
+  #     container equivale a dar root no host para ele: quem fala com o
+  #     socket cria container privilegiado e monta o filesystem inteiro.
+  #
+  #     Este proxy fica no meio e libera só o que o Promtail usa — leitura de
+  #     containers. `POST=0` é a linha que importa: sem POST não se cria, não
+  #     se para e não se executa nada.
+  # -------------------------------------------------------------------------
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy:0.3.0
+    container_name: docker-socket-proxy
+    hostname: docker-socket-proxy
+    restart: *restart-padrao
+    logging: *logging-padrao
+
+    environment:
+      # Necessários para o cliente Docker negociar a versão da API.
+      PING: "1"
+      VERSION: "1"
+      # O que o Promtail realmente usa: listar containers e ler seus logs.
+      CONTAINERS: "1"
+      # E LER as redes. A descoberta do Promtail monta as labels
+      # `__meta_docker_network_*` e consulta /networks para isso; sem esta
+      # permissão a descoberta falha inteira com 403 ("error while computing
+      # network labels"), mesmo com /containers liberado. É leitura: continua
+      # não podendo criar nem alterar rede nenhuma.
+      NETWORKS: "1"
+      # Todo o resto fica fechado. `POST=0` é a linha que importa — sem POST
+      # não se cria, não se para e não se executa nada, que é a razão de o
+      # proxy existir.
+      POST: "0"
+      EXEC: "0"
+      IMAGES: "0"
+      VOLUMES: "0"
+      INFO: "0"
+      SERVICES: "0"
+      TASKS: "0"
+      SECRETS: "0"
+      NODES: "0"
+      LOG_LEVEL: warning
+
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+    expose:
+      - "2375"
+
+    networks:
+      - korp-net
+
+    security_opt:
+      - no-new-privileges:true
+
+  # -------------------------------------------------------------------------
+  # 11) Promtail — lê os logs dos containers e entrega ao Loki.
+  # -------------------------------------------------------------------------
+  promtail:
+    image: grafana/promtail:3.3.2
+    container_name: promtail
+    hostname: promtail
+    restart: *restart-padrao
+    logging: *logging-padrao
+
+    command: ["-config.file=/etc/promtail/promtail-config.yml"]
+
+    volumes:
+      - ./promtail/promtail-config.yml:/etc/promtail/promtail-config.yml:ro
+      # Guarda até onde cada log já foi lido. Em volume nomeado para que um
+      # restart não reenvie tudo desde o início e duplique log no Loki.
+      - promtail-data:/promtail
+
+    expose:
+      - "9080"
+
+    networks:
+      - korp-net
+
+    # `service_started` e não `service_healthy` porque o Loki não expõe
+    # estado de saúde (ver o comentário no serviço acima). O Promtail
+    # aguenta o Loki ainda subindo: o `backoff_config` da configuração dele
+    # tenta por ~5 minutos antes de descartar qualquer linha.
+    depends_on:
+      loki:
+        condition: service_started
+      docker-socket-proxy:
+        condition: service_started
+
+    # Não tem mais o socket do Docker (fala com o proxy pela rede), então
+    # não precisa de capability nenhuma.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  # -------------------------------------------------------------------------
+  # 12) Gerador de carga (opcional) — só sobe com o perfil `carga`:
   #        docker compose --profile carga up -d
   #    Existe para os gráficos terem tráfego real durante a demonstração.
   # -------------------------------------------------------------------------
@@ -313,3 +567,12 @@ volumes:
     name: projeto-korp-prometheus-data
   grafana-data:
     name: projeto-korp-grafana-data
+  # Silencios e o estado de notificacao ("ja avisei sobre isto") do
+  # Alertmanager. Perder este volume faz todo alerta ativo ser notificado de
+  # novo do zero no proximo restart.
+  alertmanager-data:
+    name: projeto-korp-alertmanager-data
+  loki-data:
+    name: projeto-korp-loki-data
+  promtail-data:
+    name: projeto-korp-promtail-data

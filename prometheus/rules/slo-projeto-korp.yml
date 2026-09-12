@@ -1,0 +1,224 @@
+# ---------------------------------------------------------------------------
+# SLO, orçamento de erro e alertas por taxa de queima.
+#
+# A diferença em relação a alertas-projeto-korp.yml: lá os alertas são por
+# LIMIAR ("p95 passou de 500ms"). Limiar sozinho tem dois defeitos conhecidos
+# — dispara por picos que se resolvem sozinhos e não diz nada sobre quanto da
+# confiabilidade prometida já foi gasta no mês.
+#
+# Aqui o alerta olha a velocidade com que o orçamento de erro está sendo
+# consumido. É a abordagem do capítulo "Alerting on SLOs" do SRE Workbook.
+#
+#   SLO de disponibilidade : 99,9% das requisições sem 5xx em 30 dias
+#   Orçamento de erro      : 0,1% = cerca de 43 minutos ruins por mês
+#
+# A taxa de queima ("burn rate") é quantas vezes mais rápido que o aceitável
+# o orçamento está indo embora. Queima 1 = o mês inteiro consome exatamente
+# o orçamento. Queima 14,4 = o orçamento do mês acaba em 2 dias.
+# ---------------------------------------------------------------------------
+groups:
+  # =========================================================================
+  # 1) Registros (recording rules)
+  #
+  # Pré-calculam as razões para que os alertas e os painéis não repitam a
+  # mesma consulta cara. O nome segue a convenção do Prometheus:
+  # nível:métrica:operações.
+  #
+  # `clamp_min` no denominador evita 0/0 quando não há tráfego nenhum (por
+  # exemplo com o gerador de carga desligado). Sem ele a série viraria NaN e
+  # apareceria como buraco no gráfico — que se lê como incidente, quando na
+  # verdade é só silêncio.
+  # =========================================================================
+  - name: slo-projeto-korp-registros
+    interval: 30s
+    rules:
+      - record: korp:erro_requisicoes:ratio_rate5m
+        expr: |
+          (sum(rate(korp_http_requests_total{status=~"5.."}[5m])) or vector(0))
+            /
+          clamp_min(sum(rate(korp_http_requests_total[5m])), 0.001)
+
+      - record: korp:erro_requisicoes:ratio_rate30m
+        expr: |
+          (sum(rate(korp_http_requests_total{status=~"5.."}[30m])) or vector(0))
+            /
+          clamp_min(sum(rate(korp_http_requests_total[30m])), 0.001)
+
+      - record: korp:erro_requisicoes:ratio_rate1h
+        expr: |
+          (sum(rate(korp_http_requests_total{status=~"5.."}[1h])) or vector(0))
+            /
+          clamp_min(sum(rate(korp_http_requests_total[1h])), 0.001)
+
+      - record: korp:erro_requisicoes:ratio_rate2h
+        expr: |
+          (sum(rate(korp_http_requests_total{status=~"5.."}[2h])) or vector(0))
+            /
+          clamp_min(sum(rate(korp_http_requests_total[2h])), 0.001)
+
+      - record: korp:erro_requisicoes:ratio_rate6h
+        expr: |
+          (sum(rate(korp_http_requests_total{status=~"5.."}[6h])) or vector(0))
+            /
+          clamp_min(sum(rate(korp_http_requests_total[6h])), 0.001)
+
+      - record: korp:erro_requisicoes:ratio_rate1d
+        expr: |
+          (sum(rate(korp_http_requests_total{status=~"5.."}[1d])) or vector(0))
+            /
+          clamp_min(sum(rate(korp_http_requests_total[1d])), 0.001)
+
+      - record: korp:erro_requisicoes:ratio_rate3d
+        expr: |
+          (sum(rate(korp_http_requests_total{status=~"5.."}[3d])) or vector(0))
+            /
+          clamp_min(sum(rate(korp_http_requests_total[3d])), 0.001)
+
+      # -------------------------------------------------------------------
+      # Taxa de queima = razão de erro dividida pelo orçamento (0,001).
+      # -------------------------------------------------------------------
+      - record: korp:queima_orcamento:rate5m
+        expr: korp:erro_requisicoes:ratio_rate5m / 0.001
+      - record: korp:queima_orcamento:rate30m
+        expr: korp:erro_requisicoes:ratio_rate30m / 0.001
+      - record: korp:queima_orcamento:rate1h
+        expr: korp:erro_requisicoes:ratio_rate1h / 0.001
+      - record: korp:queima_orcamento:rate2h
+        expr: korp:erro_requisicoes:ratio_rate2h / 0.001
+      - record: korp:queima_orcamento:rate6h
+        expr: korp:erro_requisicoes:ratio_rate6h / 0.001
+      - record: korp:queima_orcamento:rate1d
+        expr: korp:erro_requisicoes:ratio_rate1d / 0.001
+      - record: korp:queima_orcamento:rate3d
+        expr: korp:erro_requisicoes:ratio_rate3d / 0.001
+
+      # -------------------------------------------------------------------
+      # Janela do SLO (30 dias).
+      #
+      # `avg_over_time` de uma razão já registrada, em vez de
+      # `rate(...[30d])` cru: a segunda forma manda o Prometheus varrer 30
+      # dias de amostras a cada avaliação, e é o jeito clássico de fazer um
+      # Prometheus pequeno engasgar.
+      # -------------------------------------------------------------------
+      - record: korp:erro_requisicoes:ratio_rate30d
+        expr: avg_over_time(korp:erro_requisicoes:ratio_rate5m[30d])
+
+      - record: korp:disponibilidade:ratio_rate30d
+        expr: 1 - korp:erro_requisicoes:ratio_rate30d
+
+      # Quanto do orçamento ainda sobra, de 1 (intacto) a 0 (esgotado).
+      # Pode ficar negativo: o SLO foi violado, e o número diz por quanto.
+      - record: korp:orcamento_erro_restante:ratio
+        expr: 1 - (korp:erro_requisicoes:ratio_rate30d / 0.001)
+
+      # -------------------------------------------------------------------
+      # SLO de latência: 99% das requisições abaixo de 250ms.
+      #
+      # Sai direto dos buckets do histograma — `le="0.25"` é um dos buckets
+      # declarados em app/metrics.go. Contar bucket é mais honesto que
+      # `histogram_quantile`, que interpola dentro do bucket e por isso
+      # devolve um p95 aproximado.
+      # -------------------------------------------------------------------
+      - record: korp:latencia_lenta:ratio_rate1h
+        expr: |
+          1 - (
+            (sum(rate(korp_http_request_duration_seconds_bucket{le="0.25"}[1h])) or vector(0))
+              /
+            clamp_min(sum(rate(korp_http_request_duration_seconds_count[1h])), 0.001)
+          )
+
+  # =========================================================================
+  # 2) Alertas por taxa de queima — duas janelas por alerta
+  #
+  # Cada alerta exige que uma janela LONGA e uma janela CURTA estejam acima
+  # do limiar ao mesmo tempo:
+  #
+  #   - a janela longa dá confiança de que o problema é real, não um pico;
+  #   - a janela curta faz o alerta PARAR sozinho depois que o problema
+  #     passa, em vez de ficar preso com a média suja.
+  #
+  # Sem a janela curta, um incidente de 10 minutos deixa o alerta ativo pelo
+  # resto da janela longa — e alerta que não limpa sozinho e alerta que todo
+  # mundo aprende a ignorar.
+  # =========================================================================
+  - name: slo-projeto-korp-alertas
+    rules:
+      # Queima rápida: 14,4x gasta o orçamento do mês em cerca de 2 dias; 6x
+      # gasta em cerca de 5. Qualquer um dos dois pares merece acordar gente.
+      - alert: OrcamentoDeErroQueimandoRapido
+        expr: |
+          (korp:queima_orcamento:rate1h > 14.4 and korp:queima_orcamento:rate5m > 14.4)
+            or
+          (korp:queima_orcamento:rate6h > 6 and korp:queima_orcamento:rate30m > 6)
+        for: 2m
+        labels:
+          severidade: critico
+          slo: disponibilidade
+        annotations:
+          resumo: "Orçamento de erro queimando rápido demais"
+          descricao: >-
+            Taxa de queima em {{ $value | printf "%.1f" }}x o ritmo aceitável.
+            Nesse passo o orçamento de 30 dias acaba em dias, não em um mês.
+
+      # Queima lenta: não acorda ninguém de madrugada, mas vira tarefa. E o
+      # caso do erro crônico de 0,5% que ninguém nota até o mês fechar.
+      - alert: OrcamentoDeErroQueimandoDevagar
+        expr: |
+          (korp:queima_orcamento:rate1d > 3 and korp:queima_orcamento:rate2h > 3)
+            or
+          (korp:queima_orcamento:rate3d > 1 and korp:queima_orcamento:rate6h > 1)
+        for: 15m
+        labels:
+          severidade: aviso
+          slo: disponibilidade
+        annotations:
+          resumo: "Orçamento de erro sendo consumido acima do ritmo"
+          descricao: >-
+            Taxa de queima de {{ $value | printf "%.1f" }}x. Não é urgente,
+            mas no ritmo atual o SLO do mês não fecha.
+
+      - alert: OrcamentoDeErroQuaseEsgotado
+        expr: korp:orcamento_erro_restante:ratio < 0.10
+        for: 10m
+        labels:
+          severidade: aviso
+          slo: disponibilidade
+        annotations:
+          resumo: "Menos de 10% do orçamento de erro restante"
+          descricao: >-
+            Sobra {{ $value | humanizePercentage }} do orçamento da janela de
+            30 dias. Daqui em diante, congelar mudancas arriscadas.
+
+      - alert: SLODeLatenciaEmRisco
+        expr: korp:latencia_lenta:ratio_rate1h > 0.01
+        for: 10m
+        labels:
+          severidade: aviso
+          slo: latencia
+        annotations:
+          resumo: "Mais de 1% das requisições acima de 250ms"
+          descricao: "Fatia lenta na última hora: {{ $value | humanizePercentage }}."
+
+  # =========================================================================
+  # 3) Dead man's switch
+  #
+  # `vector(1)` é verdadeiro sempre, então este alerta dispara para sempre,
+  # de propósito. Ele não monitora o servico — monitora o monitoramento.
+  #
+  # Enquanto ele chega no notificador a cada 5 minutos, está provado que a
+  # corrente inteira funciona: Prometheus avaliando regras, Alertmanager
+  # roteando, webhook entregue. No dia em que o Prometheus cair, TODOS os
+  # outros alertas também param de chegar — e um canal silencioso é
+  # indistinguível de um canal saudável. O silêncio DESTE alerta é o sinal.
+  # =========================================================================
+  - name: pipeline-de-alertas
+    rules:
+      - alert: PipelineDeAlertasViva
+        expr: vector(1)
+        labels:
+          severidade: watchdog
+        annotations:
+          resumo: "Pulso da cadeia de alertas"
+          descricao: >-
+            Dispara sempre. Se parar de chegar, o problema está no
+            Prometheus, no Alertmanager ou na rede entre eles.
